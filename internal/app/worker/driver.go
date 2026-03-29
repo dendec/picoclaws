@@ -1,0 +1,340 @@
+package worker
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog/log"
+	"picoclaws/internal/platform/telegram/tgutil"
+	"github.com/sipeed/picoclaw/pkg/agent"
+	"github.com/sipeed/picoclaw/pkg/bus"
+	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/media"
+	"github.com/sipeed/picoclaw/pkg/providers"
+	"github.com/sipeed/picoclaw/pkg/tools"
+)
+
+type processOptions struct {
+	SessionKey      string
+	Channel         string
+	ChatID          string
+	UserMessage        string
+	Media              []string
+	DefaultResponse    string
+	EnableSummary      bool
+	SendResponse       bool
+	SenderID           string
+	SenderDisplayName   string
+	ReasoningChannelID   string
+	SuppressToolFeedback bool
+	SuppressReasoning    bool
+}
+
+// Driver provides single-shot agent execution logic.
+type Driver struct {
+	Bus        *bus.MessageBus
+	MediaStore media.MediaStore
+	Config     *config.Config
+}
+
+func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts processOptions) (string, error) {
+	// 1. Build messages
+	history := inst.Sessions.GetHistory(opts.SessionKey)
+	summary := inst.Sessions.GetSummary(opts.SessionKey)
+
+	messages := inst.ContextBuilder.BuildMessages(
+		history,
+		summary,
+		opts.UserMessage,
+		opts.Media,
+		opts.Channel,
+		opts.ChatID,
+		opts.SenderID,
+		opts.SenderDisplayName,
+	)
+
+	// Resolve media:// refs
+	maxMediaSize := d.Config.Agents.Defaults.GetMaxMediaSize()
+	messages = d.resolveMediaRefs(messages, int64(maxMediaSize))
+
+	// 2. Log and save user message
+	log.Ctx(ctx).Info().
+		Str("chat_id", opts.ChatID).
+		Str("sender_id", opts.SenderID).
+		Str("sender_name", opts.SenderDisplayName).
+		Str("message", opts.UserMessage).
+		Int("media_count", len(opts.Media)).
+		Msg("User message received")
+	inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
+
+	// 3. Run LLM iteration loop
+	finalContent, iteration, err := d.runIteration(ctx, inst, messages, opts)
+	if err != nil {
+		return "", err
+	}
+
+	if finalContent == "" {
+		finalContent = opts.DefaultResponse
+	}
+
+	// 4. Save final assistant message to session
+	inst.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+	inst.Sessions.Save(opts.SessionKey)
+
+	// 5. Send response via bus if requested
+	if opts.SendResponse {
+		_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
+			Channel: opts.Channel,
+			ChatID:  opts.ChatID,
+			Content: finalContent,
+		})
+	}
+
+	log.Ctx(ctx).Info().
+		Str("agent_id", inst.ID).
+		Str("chat_id", opts.ChatID).
+		Str("session_key", opts.SessionKey).
+		Int("iterations", iteration).
+		Int("content_len", len(finalContent)).
+		Str("response", finalContent).
+		Msg("Agent processing complete")
+
+	return finalContent, nil
+}
+
+func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, messages []providers.Message, opts processOptions) (string, int, error) {
+	iteration := 0
+	var finalContent string
+
+	// Simple active model selection (ignore routing for now, or implement if needed)
+	activeModel := inst.Model
+
+	for iteration < inst.MaxIterations {
+		iteration++
+
+		providerToolDefs := inst.Tools.ToProviderDefs()
+
+		llmOpts := map[string]any{
+			"max_tokens":       inst.MaxTokens,
+			"temperature":      inst.Temperature,
+			"prompt_cache_key": inst.ID,
+		}
+
+		response, err := inst.Provider.Chat(ctx, messages, providerToolDefs, activeModel, llmOpts)
+		if err != nil {
+			return "", iteration, fmt.Errorf("LLM call failed: %w", err)
+		}
+
+		// Handle reasoning (async best-effort)
+		if response.Reasoning != "" {
+			// Always log reasoning to system log
+			log.Ctx(ctx).Info().
+				Str("chat_id", opts.ChatID).
+				Str("reasoning", response.Reasoning).
+				Msg("Agent reasoning")
+
+			if !opts.SuppressReasoning {
+				go func() {
+					pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					_ = d.Bus.PublishOutbound(pubCtx, bus.OutboundMessage{
+						Channel: opts.Channel,
+						ChatID:  opts.ChatID,
+						Content: response.Reasoning,
+					})
+				}()
+			}
+		}
+
+		if len(response.ToolCalls) == 0 {
+			finalContent = response.Content
+			if finalContent == "" && response.ReasoningContent != "" {
+				finalContent = response.ReasoningContent
+			}
+			break
+		}
+
+		// Process Tool Calls
+		assistantMsg := providers.Message{
+			Role:             "assistant",
+			Content:          response.Content,
+			ReasoningContent: response.ReasoningContent,
+		}
+
+		for _, tc := range response.ToolCalls {
+			tcNorm := providers.NormalizeToolCall(tc)
+			argsJSON, _ := json.Marshal(tcNorm.Arguments)
+			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+				ID:   tcNorm.ID,
+				Type: "function",
+				Name: tcNorm.Name,
+				Function: &providers.FunctionCall{
+					Name:             tcNorm.Name,
+					Arguments:        string(argsJSON),
+					ThoughtSignature: tcNorm.ThoughtSignature,
+				},
+				ExtraContent:     tcNorm.ExtraContent,
+				ThoughtSignature: tcNorm.ThoughtSignature,
+			})
+		}
+		messages = append(messages, assistantMsg)
+		inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+
+		// Log tool calls
+		for _, tc := range assistantMsg.ToolCalls {
+			log.Ctx(ctx).Info().
+				Str("chat_id", opts.ChatID).
+				Str("tool", tc.Name).
+				Str("tool_call_id", tc.ID).
+				Str("arguments", tc.Function.Arguments).
+				Int("iteration", iteration).
+				Msg("Tool call")
+		}
+
+		// Execute tools in parallel
+		type result struct {
+			idx int
+			res *tools.ToolResult
+			tc  providers.ToolCall
+		}
+		results := make([]result, len(assistantMsg.ToolCalls))
+		var wg sync.WaitGroup
+		for i, tc := range assistantMsg.ToolCalls {
+			wg.Add(1)
+			go func(idx int, t providers.ToolCall) {
+				defer wg.Done()
+				var args map[string]any
+				_ = json.Unmarshal([]byte(t.Function.Arguments), &args)
+				res := inst.Tools.ExecuteWithContext(ctx, t.Name, args, opts.Channel, opts.ChatID, nil)
+				results[idx] = result{idx: idx, res: res, tc: t}
+			}(i, tc)
+		}
+		wg.Wait()
+
+		// Handle results
+		for _, r := range results {
+			// Always log tool results to system log
+			log.Ctx(ctx).Info().
+				Str("chat_id", opts.ChatID).
+				Str("tool", r.tc.Name).
+				Str("tool_call_id", r.tc.ID).
+				Str("result", r.res.ForLLM).
+				Bool("is_error", r.res.IsError).
+				Bool("silent", r.res.Silent).
+				Msg("Tool result")
+
+			// Immediate feedback for user if not silent and not suppressed
+			if !opts.SuppressToolFeedback && !r.res.Silent && r.res.ForUser != "" {
+				_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
+					Channel: opts.Channel,
+					ChatID:  opts.ChatID,
+					Content: r.res.ForUser,
+				})
+			}
+
+			// Media results
+			if len(r.res.Media) > 0 {
+				parts := make([]bus.MediaPart, 0, len(r.res.Media))
+				for _, ref := range r.res.Media {
+					part := bus.MediaPart{Ref: ref}
+					if d.MediaStore != nil {
+						if _, meta, err := d.MediaStore.ResolveWithMeta(ref); err == nil {
+							part.Filename = meta.Filename
+							part.ContentType = meta.ContentType
+							part.Type = tgutil.InferMediaType(meta.Filename, meta.ContentType)
+						}
+					}
+					parts = append(parts, part)
+				}
+				_ = d.Bus.PublishOutboundMedia(ctx, bus.OutboundMediaMessage{
+					Channel: opts.Channel,
+					ChatID:  opts.ChatID,
+					Parts:   parts,
+				})
+			}
+
+			contentForLLM := r.res.ForLLM
+			if contentForLLM == "" && r.res.Err != nil {
+				contentForLLM = r.res.Err.Error()
+			}
+			toolResultMsg := providers.Message{
+				Role:       "tool",
+				Content:    contentForLLM,
+				ToolCallID: r.tc.ID,
+			}
+			messages = append(messages, toolResultMsg)
+			inst.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+		}
+
+		inst.Tools.TickTTL()
+	}
+
+	return finalContent, iteration, nil
+}
+
+func (d *Driver) resolveMediaRefs(messages []providers.Message, maxSize int64) []providers.Message {
+	if d.MediaStore == nil {
+		return messages
+	}
+	for i := range messages {
+		for j := range messages[i].Media {
+			ref := messages[i].Media[j]
+			if strings.HasPrefix(ref, "media://") {
+				path, _, err := d.MediaStore.ResolveWithMeta(ref)
+				if err == nil {
+					// In a real implementation we might convert to base64 or pass differently.
+					// Official picoclaw converts to data URL here.
+					if data, err := d.encodeFileToBase64(path, maxSize); err == nil {
+						messages[i].Media[j] = data
+					}
+				}
+			}
+		}
+	}
+	return messages
+}
+
+func (d *Driver) encodeFileToBase64(path string, maxSize int64) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.Size() > maxSize {
+		return "", fmt.Errorf("file too large: %d > %d", info.Size(), maxSize)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	// Simplistic MIME detection for the data URL
+	ext := filepath.Ext(path)
+	mime := "application/octet-stream"
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		mime = "image/jpeg"
+	case ".png":
+		mime = "image/png"
+	case ".gif":
+		mime = "image/gif"
+	case ".webp":
+		mime = "image/webp"
+	case ".ogg":
+		mime = "audio/ogg"
+	case ".mp3":
+		mime = "audio/mpeg"
+	case ".mp4":
+		mime = "video/mp4"
+	}
+
+	encoded := "data:" + mime + ";base64," + strings.TrimSpace(base64.StdEncoding.EncodeToString(data))
+	return encoded, nil
+}

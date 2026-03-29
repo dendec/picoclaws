@@ -1,0 +1,29 @@
+{
+  "agents": {
+    "defaults": {
+      "model_name": "gemini-2.0-flash",
+      "workspace": "/tmp/picoclaw/workspace"
+    }
+  },
+  "model_list": [
+    {
+      "model_name": "gemini-2.0-flash",
+      "model": "gemini/gemini-2.0-flash-exp",
+      "api_key": "YOUR_GOOGLE_AI_API_KEY_HERE"
+    }
+  ],
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+    }
+  },
+  "tools": {
+    "web": {
+      "enabled": true
+    },
+    "exec": {
+      "enabled": true
+    }
+  }
+}

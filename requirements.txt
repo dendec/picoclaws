@@ -1,0 +1,7 @@
+pillow
+requests
+beautifulsoup4
+pyyaml
+defusedxml
+httpx
+tenacity

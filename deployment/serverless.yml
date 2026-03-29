@@ -1,0 +1,95 @@
+service: picoclaw
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: provided.al2023
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'eu-west-1'}
+  architecture: arm64
+  profile: ${opt:profile, env:AWS_PROFILE, 'default'}
+  deploymentBucket: ${env:DEPLOYMENT_BUCKET}
+  environment:
+    PICOCLAW_HOME: /tmp/picoclaw
+    PICOCLAW_WORKSPACE_BUCKET: !Ref WorkspacesBucket
+    LOG_LEVEL: ${env:LOG_LEVEL, "debug"}
+    QUEUE_URL: !Ref UpdatesQueue
+    AUTO_SETUP: ${env:AUTO_SETUP, "true"}
+    # PICOCLAW_LOG_FILE: /dev/stderr
+    # Config is now bundled in config.json
+
+package:
+  individually: true
+
+functions:
+  webhook:
+    handler: bootstrap
+    package:
+      artifact: ../build/tg-webhook-lambda.zip
+    url: true
+    memorySize: 256
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - sqs:SendMessage
+        Resource: !GetAtt UpdatesQueue.Arn
+      - Effect: Allow
+        Action:
+          - s3:DeleteObject
+        Resource:
+          - !Join ["/", [!GetAtt WorkspacesBucket.Arn, "workspaces/*"]]
+
+  worker:
+    handler: bootstrap
+    package:
+      artifact: ../build/tg-worker-lambda.zip
+    timeout: 900 # 15 minutes
+    memorySize: 256
+    environment:
+      PATH: /var/task/assets/bin:/var/task/assets/python/bin:/opt/bin:/usr/local/bin:/usr/bin:/bin
+      PYTHONHOME: /var/task/assets/python
+      PYTHONPATH: /var/task/assets/python/lib/python3.12/site-packages
+      LD_LIBRARY_PATH: /var/task/assets/python/lib
+    events:
+      - sqs:
+          arn: !GetAtt UpdatesQueue.Arn
+          batchSize: 1
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+          - s3:ListBucket
+        Resource:
+          - !GetAtt WorkspacesBucket.Arn
+          - !Join ["/", [!GetAtt WorkspacesBucket.Arn, "*"]]
+
+resources:
+  Resources:
+    # --- Storage (S3) ---
+    WorkspacesBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: picoclaw-workspaces-${self:provider.stage}-${self:provider.region}
+
+    # --- Communication (SQS) ---
+    UpdatesQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: picoclaw-updates-queue.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 300 # Must be >= Lambda timeout
+
+custom:
+  dotenv:
+    exclude:
+      - AWS_PROFILE
+      - AWS_REGION
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+
+plugins:
+  - serverless-iam-roles-per-function
+  - serverless-dotenv-plugin

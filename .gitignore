@@ -1,0 +1,28 @@
+# Binaries
+bin/
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# PicoClaw specific
+.picoclaw/
+config.json
+sessions/
+assets/
+
+# Secrets & Config (keep templates, ignore actual secrets)
+.env
+deployment/.env
+deployment/.serverless/
+deployment/node_modules/
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
