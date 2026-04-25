@@ -44,6 +44,13 @@ download-bins:
 		echo "Downloading static curl (ARM64)..."; \
 		curl -sL https://github.com/moparisthebest/static-curl/releases/download/v8.7.1/curl-aarch64 -o $(BIN_TARGET)/curl && chmod +x $(BIN_TARGET)/curl; \
 	fi
+	@if [ ! -f $(BIN_TARGET)/gh ]; then \
+		echo "Downloading GitHub CLI (ARM64)..."; \
+		curl -sL https://github.com/cli/cli/releases/download/v2.65.0/gh_2.65.0_linux_arm64.tar.gz -o $(BIN_TARGET)/gh.tar.gz; \
+		tar -xzf $(BIN_TARGET)/gh.tar.gz -C $(BIN_TARGET) --strip-components=2 gh_2.65.0_linux_arm64/bin/gh; \
+		rm $(BIN_TARGET)/gh.tar.gz; \
+		chmod +x $(BIN_TARGET)/gh; \
+	fi
 
 ## download-python: Download portable Aarch64 Python 3.12
 download-python:
@@ -73,7 +80,7 @@ clean-deps:
 	@rm -rf $(PYTHON_TARGET)/*
 
 ## build-lambdas: Build all PicoClAWS Lambdas for AWS (Linux/ARM64)
-build-lambdas: download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda
+build-lambdas: download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda build-tg-heartbeat-lambda
 
 ## build-tg-webhook-lambda: Build the Telegram Webhook Lambda for AWS
 build-tg-webhook-lambda:
@@ -98,6 +105,15 @@ build-tg-worker-lambda:
 	@cd $(BUILD_DIR)/tg-worker-lambda && zip -qry ../tg-worker-lambda.zip bootstrap config.json assets
 	@echo "Build complete: $(BUILD_DIR)/tg-worker-lambda.zip"
 
+## build-tg-heartbeat-lambda: Build the Heartbeat Dispatcher Lambda for AWS
+build-tg-heartbeat-lambda:
+	@echo "Building tg-heartbeat-lambda for AWS (Linux/ARM64)..."
+	@mkdir -p $(BUILD_DIR)/tg-heartbeat-lambda
+	GOOS=linux GOARCH=arm64 $(GO) build $(LDFLAGS) -o $(BUILD_DIR)/tg-heartbeat-lambda/bootstrap ./cmd/tg-heartbeat-lambda
+	@echo "Building zip: $(BUILD_DIR)/tg-heartbeat-lambda.zip"
+	@cd $(BUILD_DIR)/tg-heartbeat-lambda && zip -qry ../tg-heartbeat-lambda.zip bootstrap
+	@echo "Build complete: $(BUILD_DIR)/tg-heartbeat-lambda.zip"
+
 ## clean: Remove build artifacts
 clean:
 	@echo "Cleaning build artifacts..."
@@ -105,14 +121,9 @@ clean:
 	@echo "Clean complete"
 
 ## deploy: Deploy Lambdas to AWS using Serverless
-deploy: build-lambdas setup-deployment
+deploy: build-lambdas
 	@echo "Deploying to AWS..."
-	@cd deployment && npm run deploy
-
-## setup-deployment: Install deployment dependencies
-setup-deployment:
-	@echo "Ensuring deployment dependencies are installed..."
-	@cd deployment && npm install
+	@cd deployment && sls deploy
 
 ## help: Show this help message
 help:

@@ -9,14 +9,11 @@ import (
 	"sync"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/mymmrac/telego"
 	"github.com/rs/zerolog/log"
-	pcfg "github.com/sipeed/picoclaw/pkg/config"
-	plog "github.com/sipeed/picoclaw/pkg/logger"
-	aws_p "picoclaws/internal/platform/aws"
+	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/logger"
+	"picoclaws/internal/platform/aws"
 	"picoclaws/internal/platform/telegram"
 	"picoclaws/internal/platform/telegram/tgutil"
 )
@@ -24,11 +21,11 @@ import (
 // WebhookApp holds dependencies for the Lambda webhook handler.
 type WebhookApp struct {
 	Bot       *telego.Bot
-	SQSClient *sqs.Client
+	SQS       *aws.SQSPublisher
 	QueueURL  string
 	Validator IPValidator
 	AutoSetup bool
-	S3Sync    *aws_p.S3Sync
+	S3Storage *aws.S3Storage
 	S3Bucket  string
 	setupOnce sync.Once
 }
@@ -51,26 +48,35 @@ func NewWebhookApp(ctx context.Context) (*WebhookApp, error) {
 		}
 	}
 
-	cfg, err := pcfg.LoadConfig(configPath)
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config from %s: %w", configPath, err)
 	}
 
-	bot, err := telego.NewBot(cfg.Channels.Telegram.Token())
+	tgChan := cfg.Channels.GetByType(config.ChannelTelegram)
+	if tgChan == nil {
+		return nil, fmt.Errorf("telegram channel not configured")
+	}
+	tgDecoded, err := tgChan.GetDecoded()
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode telegram settings: %w", err)
+	}
+	tgSettings, ok := tgDecoded.(*config.TelegramSettings)
+	if !ok {
+		return nil, fmt.Errorf("invalid telegram settings type")
+	}
+
+	bot, err := telego.NewBot(tgSettings.Token.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create bot: %w (check token in %s)", err, configPath)
 	}
 
 	// 1. Configure picoclaw logger
-	plog.SetLevelFromString(os.Getenv("LOG_LEVEL"))
+	logger.SetLevelFromString(os.Getenv("LOG_LEVEL"))
 	if os.Getenv("PICOCLAW_LOG_FILE") != "" {
-		plog.ConfigureFromEnv()
+		logger.ConfigureFromEnv()
 	}
 
-	awsCfg, err := config.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config: %w", err)
-	}
 
 	validator, err := telegram.NewIPValidator()
 	if err != nil {
@@ -81,18 +87,23 @@ func NewWebhookApp(ctx context.Context) (*WebhookApp, error) {
 	if s3Bucket == "" {
 		return nil, fmt.Errorf("PICOCLAW_WORKSPACE_BUCKET is required")
 	}
-	s3Sync, err := aws_p.NewS3Sync(ctx, s3Bucket)
+	s3Storage, err := aws.NewS3Storage(ctx, s3Bucket)
 	if err != nil {
-		return nil, fmt.Errorf("failed to init S3 sync: %w", err)
+		return nil, fmt.Errorf("failed to init S3 storage: %w", err)
+	}
+
+	sqsHandler, err := aws.NewSQSPublisher(ctx, queueURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init SQS publisher: %w", err)
 	}
 
 	return &WebhookApp{
 		Bot:       bot,
-		SQSClient: sqs.NewFromConfig(awsCfg),
+		SQS:       sqsHandler,
 		QueueURL:  queueURL,
 		Validator: validator,
 		AutoSetup: autoSetup,
-		S3Sync:    s3Sync,
+		S3Storage: s3Storage,
 		S3Bucket:  s3Bucket,
 	}, nil
 }
@@ -167,7 +178,7 @@ func (a *WebhookApp) handleCommand(ctx context.Context, update telego.Update) (b
 		s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
 		logger.Info().Str("chat_id", chatID).Str("key", s3Key).Msg("Executing /reset command")
 
-		if err := a.S3Sync.Delete(ctx, s3Key); err != nil {
+		if err := a.S3Storage.Delete(ctx, s3Key); err != nil {
 			logger.Error().Err(err).Msg("Failed to delete workspace from S3")
 		}
 		// We return true but don't send a message yet; the worker will handle the response
@@ -189,23 +200,10 @@ func (a *WebhookApp) ProcessUpdate(ctx context.Context, update telego.Update) er
 		logger.Info().Msg("Command handled, continuing to SQS for agent response")
 	}
 
-	body, err := json.Marshal(update)
-	if err != nil {
-		return fmt.Errorf("marshal update: %w", err)
-	}
-
-	input := &sqs.SendMessageInput{
-		QueueUrl:    aws.String(a.QueueURL),
-		MessageBody: aws.String(string(body)),
-	}
-
-	// If it's a FIFO queue, we MUST provide MessageGroupId
-	// We use the chat ID to ensure sequential processing for each chat
+	body, _ := json.Marshal(update)
 	chatID := tgutil.ExtractChatID(update)
-	input.MessageGroupId = aws.String(chatID)
 
-	_, err = a.SQSClient.SendMessage(ctx, input)
-	if err != nil {
+	if err := a.SQS.SendMessage(ctx, string(body), chatID); err != nil {
 		logger.Error().Err(err).Msg("Failed to send message to SQS")
 		return err
 	}

@@ -15,8 +15,26 @@ provider:
     LOG_LEVEL: ${env:LOG_LEVEL, "debug"}
     QUEUE_URL: !Ref UpdatesQueue
     AUTO_SETUP: ${env:AUTO_SETUP, "true"}
-    # PICOCLAW_LOG_FILE: /dev/stderr
-    # Config is now bundled in config.json
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource: !GetAtt UpdatesQueue.Arn
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:DeleteObject
+            - s3:ListBucket
+          Resource: 
+            - !GetAtt WorkspacesBucket.Arn
+            - !Sub ${WorkspacesBucket.Arn}/*
 
 package:
   individually: true
@@ -28,16 +46,6 @@ functions:
       artifact: ../build/tg-webhook-lambda.zip
     url: true
     memorySize: 256
-    iamRoleStatements:
-      - Effect: Allow
-        Action:
-          - sqs:SendMessage
-        Resource: !GetAtt UpdatesQueue.Arn
-      - Effect: Allow
-        Action:
-          - s3:DeleteObject
-        Resource:
-          - !Join ["/", [!GetAtt WorkspacesBucket.Arn, "workspaces/*"]]
 
   worker:
     handler: bootstrap
@@ -54,15 +62,20 @@ functions:
       - sqs:
           arn: !GetAtt UpdatesQueue.Arn
           batchSize: 1
-    iamRoleStatements:
-      - Effect: Allow
-        Action:
-          - s3:GetObject
-          - s3:PutObject
-          - s3:ListBucket
-        Resource:
-          - !GetAtt WorkspacesBucket.Arn
-          - !Join ["/", [!GetAtt WorkspacesBucket.Arn, "*"]]
+
+  heartbeat:
+    handler: bootstrap
+    package:
+      artifact: ../build/tg-heartbeat-lambda.zip
+    timeout: 300
+    memorySize: 128
+    environment:
+      QUEUE_URL: !Ref UpdatesQueue
+      PICOCLAW_WORKSPACE_BUCKET: !Ref WorkspacesBucket
+    events:
+      - schedule:
+          rate: rate(1 hour)
+          enabled: true
 
 resources:
   Resources:
@@ -80,16 +93,3 @@ resources:
         FifoQueue: true
         ContentBasedDeduplication: true
         VisibilityTimeout: 300 # Must be >= Lambda timeout
-
-custom:
-  dotenv:
-    exclude:
-      - AWS_PROFILE
-      - AWS_REGION
-      - AWS_ACCESS_KEY_ID
-      - AWS_SECRET_ACCESS_KEY
-      - AWS_SESSION_TOKEN
-
-plugins:
-  - serverless-iam-roles-per-function
-  - serverless-dotenv-plugin

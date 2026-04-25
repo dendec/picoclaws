@@ -14,20 +14,20 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// S3Sync handles uploading and downloading archives to/from S3.
-type S3Sync struct {
+// S3Storage handles uploading and downloading archives to/from S3.
+type S3Storage struct {
 	client *s3.Client
 	bucket string
 }
 
-// NewS3Sync creates a new S3Sync helper.
-func NewS3Sync(ctx context.Context, bucket string) (*S3Sync, error) {
+// NewS3Storage creates a new S3Storage helper.
+func NewS3Storage(ctx context.Context, bucket string) (*S3Storage, error) {
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	return &S3Sync{
+	return &S3Storage{
 		client: s3.NewFromConfig(cfg),
 		bucket: bucket,
 	}, nil
@@ -35,7 +35,7 @@ func NewS3Sync(ctx context.Context, bucket string) (*S3Sync, error) {
 
 // Download fetches the archive from S3.
 // Returns nil if the object doesn't exist (fresh workspace).
-func (s *S3Sync) Download(ctx context.Context, key string) ([]byte, error) {
+func (s *S3Storage) Download(ctx context.Context, key string) ([]byte, error) {
 	output, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -60,7 +60,7 @@ type S3Metadata struct {
 }
 
 // GetMetadata fetches only the metadata (HeadObject) from S3.
-func (s *S3Sync) GetMetadata(ctx context.Context, key string) (*S3Metadata, error) {
+func (s *S3Storage) GetMetadata(ctx context.Context, key string) (*S3Metadata, error) {
 	output, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -84,7 +84,7 @@ func (s *S3Sync) GetMetadata(ctx context.Context, key string) (*S3Metadata, erro
 }
 
 // Upload puts the archive data to S3.
-func (s *S3Sync) Upload(ctx context.Context, key string, data []byte) error {
+func (s *S3Storage) Upload(ctx context.Context, key string, data []byte) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -97,7 +97,7 @@ func (s *S3Sync) Upload(ctx context.Context, key string, data []byte) error {
 }
 
 // Delete removes the object from S3.
-func (s *S3Sync) Delete(ctx context.Context, key string) error {
+func (s *S3Storage) Delete(ctx context.Context, key string) error {
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
@@ -106,6 +106,34 @@ func (s *S3Sync) Delete(ctx context.Context, key string) error {
 		return fmt.Errorf("failed to delete S3 object: %w", err)
 	}
 	return nil
+}
+
+// ListKeys returns all object keys starting with the given prefix.
+func (s *S3Storage) ListKeys(ctx context.Context, prefix string) ([]string, error) {
+	var keys []string
+	var continuationToken *string
+
+	for {
+		output, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuationToken,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to list S3 objects: %w", err)
+		}
+
+		for _, obj := range output.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+
+		if !aws.ToBool(output.IsTruncated) {
+			break
+		}
+		continuationToken = output.NextContinuationToken
+	}
+
+	return keys, nil
 }
 
 // IsNoSuchKey checks if an error is an AWS S3 NoSuchKey or NotFound error.

@@ -21,10 +21,10 @@ import (
 	"github.com/sipeed/picoclaw/pkg/agent"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels/telegram"
-	pcfg "github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/providers"
-	plog "github.com/sipeed/picoclaw/pkg/logger"
 )
 
 // WorkerApp manages the lifecycle of a worker instance, handling
@@ -36,6 +36,11 @@ type WorkerApp struct {
 	Bot        *telego.Bot
 	MediaStore media.MediaStore
 	BaseDir    string
+}
+
+type HeartbeatMessage struct {
+	Type   string `json:"type"`
+	ChatID string `json:"chat_id"`
 }
 
 func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
@@ -62,7 +67,7 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 		}
 	}
 
-	cfg, err := pcfg.LoadConfig(configPath)
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load config from %s: %w", configPath, err)
 	}
@@ -85,21 +90,34 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 
 	msgBus := bus.NewMessageBus()
 
-	bot, err := telego.NewBot(cfg.Channels.Telegram.Token())
+	tgBC := cfg.Channels.GetByType(config.ChannelTelegram)
+	if tgBC == nil {
+		return nil, fmt.Errorf("telegram channel not configured")
+	}
+	tgDecoded, err := tgBC.GetDecoded()
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode telegram settings: %w", err)
+	}
+	tgSettings, ok := tgDecoded.(*config.TelegramSettings)
+	if !ok {
+		return nil, fmt.Errorf("invalid telegram settings type")
+	}
+
+	bot, err := telego.NewBot(tgSettings.Token.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
 	}
 
 	// 1. Configure picoclaw logger
-	plog.SetLevelFromString(os.Getenv("LOG_LEVEL"))
+	logger.SetLevelFromString(os.Getenv("LOG_LEVEL"))
 	if os.Getenv("PICOCLAW_LOG_FILE") != "" {
-		plog.ConfigureFromEnv()
+		logger.ConfigureFromEnv()
 	} else if os.Getenv("AWS_LAMBDA_FUNCTION_NAME") != "" {
 		// In Lambda, use JSON output for CloudWatch compatibility
-		plog.UseJSONOutput()
+		logger.UseJSONOutput()
 	}
 
-	tgChan, err := telegram.NewTelegramChannel(cfg, msgBus)
+	tgChan, err := telegram.NewTelegramChannel(tgBC, tgSettings, msgBus)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Telegram channel: %w", err)
 	}
@@ -124,75 +142,138 @@ func (a *WorkerApp) Handle(ctx context.Context, sqsEvent events.SQSEvent) error 
 	logger := log.Ctx(ctx).With().Str("component", "tg-worker").Logger()
 	ctx = logger.WithContext(ctx)
 
-	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
-	var s3Sync *aws.S3Sync
-	if bucket != "" {
-		var err error
-		s3Sync, err = aws.NewS3Sync(ctx, bucket)
-		if err != nil {
-			logger.Error().Err(err).Msg("Failed to initialize S3 sync")
-		}
-	}
-
 	for _, record := range sqsEvent.Records {
-		if err := a.processRecord(ctx, record, s3Sync); err != nil {
-			logger.Error().
-				Str("message_id", record.MessageId).
-				Err(err).
-				Msg("Failed to process SQS record")
+		if err := a.processSQSRecord(ctx, record); err != nil {
+			logger.Error().Str("message_id", record.MessageId).Err(err).Msg("Failed to process SQS record")
 		}
 	}
 	return nil
 }
 
-func (a *WorkerApp) processRecord(ctx context.Context, record events.SQSMessage, s3Sync *aws.S3Sync) error {
+func (a *WorkerApp) processSQSRecord(ctx context.Context, record events.SQSMessage) error {
+	// 1. Try to unmarshal as HeartbeatMessage first
+	var hb HeartbeatMessage
+	if err := json.Unmarshal([]byte(record.Body), &hb); err == nil && hb.Type == "heartbeat" {
+		log.Ctx(ctx).Info().Str("chat_id", hb.ChatID).Msg("Processing internal heartbeat message")
+
+		inMsg := &bus.InboundMessage{
+			Context: bus.InboundContext{
+				Channel: "telegram",
+				ChatID:  hb.ChatID,
+			},
+			ChatID:  hb.ChatID,
+			Channel: "telegram",
+		}
+		return a.processAgentTurn(ctx, hb.ChatID, inMsg, true)
+	}
+
+	// 2. Fallback to Telegram Update
 	var update telego.Update
 	if err := json.Unmarshal([]byte(record.Body), &update); err != nil {
 		return fmt.Errorf("unmarshal telegram update: %w", err)
 	}
 
-	chatID := tgutil.ExtractChatID(update)
+	inMsg, err := tgutil.TranslateUpdate(ctx, a.Bot, update, a.MediaStore, "")
+	if err != nil {
+		return fmt.Errorf("translate update: %w", err)
+	}
+
+	// Handle special system commands (e.g., /reset)
+	a.handleSpecialCommands(ctx, inMsg)
+
+	return a.processAgentTurn(ctx, inMsg.Context.ChatID, inMsg, false)
+}
+
+func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *bus.InboundMessage, isHeartbeat bool) error {
+	logger := log.Ctx(ctx).With().Str("chat_id", chatID).Logger()
+	ctx = logger.WithContext(ctx)
+
+	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
+	var s3Storage *aws.S3Storage
+	if bucket != "" {
+		var err error
+		s3Storage, err = aws.NewS3Storage(ctx, bucket)
+		if err != nil {
+			logger.Error().Err(err).Msg("Failed to initialize S3 storage")
+		}
+	}
+
 	chatWorkspaceBase, mainWorkspace := a.getWorkspacePaths(chatID)
 
 	// 1. Prepare Workspace (S3 + Assets)
-	if err := a.prepareWorkspace(ctx, s3Sync, chatID, chatWorkspaceBase, mainWorkspace); err != nil {
+	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspaceBase, mainWorkspace)
+	if err != nil {
 		return err
 	}
 
-	// 2. Create Isolated Agent
+	// 2. Check for heartbeat tasks (AFTER workspace is ready on disk)
+	if isHeartbeat {
+		prompt := a.buildHeartbeatPrompt(ctx, chatID)
+		if prompt == "" {
+			logger.Debug().Msg("No heartbeat tasks found, skipping agent execution")
+			return nil
+		}
+		inMsg.Content = prompt
+	}
+
+	// 3. Create Isolated Agent
 	agentInst, err := a.createAgent(chatWorkspaceBase)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
 	defer agentInst.Close()
 
-	// 3. Translate Update into agent-readable message
-	inMsg, err := tgutil.TranslateUpdate(ctx, a.Bot, update, a.MediaStore, "")
-	if err != nil {
-		return fmt.Errorf("translate update: %w", err)
+	// 4. Initialize USER.md for fresh workspaces
+	if isNew {
+		a.initUserMetadata(mainWorkspace, inMsg)
 	}
 
-	// 3.1. Handle special system commands (e.g., /reset)
-	a.handleSpecialCommands(ctx, inMsg)
-
-	// 4. Execute Turn
+	// 5. Execute Turn
 	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspaceBase)
 
-	// 5. Finalize Workspace (S3 + Cleanup)
+	// 6. Finalize Workspace (S3 + Cleanup)
 	if modified {
-		a.finalizeWorkspace(ctx, s3Sync, chatID, chatWorkspaceBase)
+		a.finalizeWorkspace(ctx, s3Storage, chatID, chatWorkspaceBase)
 	} else {
-		log.Ctx(ctx).Info().Str("chat_id", chatID).Msg("Workspace unchanged, skipping S3 upload")
+		logger.Info().Msg("Workspace unchanged, skipping S3 upload")
 	}
 
 	return processErr
+}
+
+func (a *WorkerApp) buildHeartbeatPrompt(ctx context.Context, chatID string) string {
+	_, mainWorkspace := a.getWorkspacePaths(chatID)
+	heartbeatPath := filepath.Join(mainWorkspace, "HEARTBEAT.md")
+
+	data, err := os.ReadFile(heartbeatPath)
+	if err != nil {
+		return ""
+	}
+
+	content := string(data)
+	// Check if there are actual tasks (using the same marker as original picoclaw)
+	if !strings.Contains(content, "Add your heartbeat tasks below this line:") {
+		return ""
+	}
+
+	now := time.Now().Format("2006-01-02 15:04:05")
+	return fmt.Sprintf(`# Heartbeat Check
+
+Current time: %s
+
+You are a proactive AI assistant. This is a scheduled heartbeat check.
+Review the following tasks and execute any necessary actions using available skills.
+If there is nothing that requires attention, respond ONLY with: HEARTBEAT_OK
+
+%s
+`, now, content)
 }
 
 // handleSpecialCommands processes incoming messages for specific triggers
 // like /reset to nudge the agent behaviorally via system instructions.
 func (a *WorkerApp) handleSpecialCommands(ctx context.Context, inMsg *bus.InboundMessage) {
 	if strings.TrimSpace(inMsg.Content) == "/reset" {
-		lang := inMsg.Metadata["language_code"]
+		lang := inMsg.Context.Raw["language_code"]
 		if lang == "" {
 			lang = "en" // fallback
 		}
@@ -212,7 +293,8 @@ func (a *WorkerApp) getWorkspacePaths(chatID string) (string, string) {
 
 // prepareWorkspace ensures the local environment is ready for the agent to work in.
 // It syncs from S3 if needed and restores default assets for fresh workspaces.
-func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Sync *aws.S3Sync, chatID, chatWorkspaceBase, mainWorkspace string) error {
+// Returns true if the workspace was initialized from scratch (assets restored).
+func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspaceBase, mainWorkspace string) (bool, error) {
 	logger := log.Ctx(ctx)
 	s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
 
@@ -220,8 +302,8 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Sync *aws.S3Sync, ch
 
 	// 1. Check S3 Metadata (ETag/LastModified)
 	var s3Meta *aws.S3Metadata
-	if s3Sync != nil {
-		if meta, err := s3Sync.GetMetadata(ctx, s3Key); err == nil {
+	if s3Storage != nil {
+		if meta, err := s3Storage.GetMetadata(ctx, s3Key); err == nil {
 			s3Meta = meta
 		}
 	}
@@ -238,8 +320,8 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Sync *aws.S3Sync, ch
 	}
 
 	restoredFromS3 := useWarmWorkspace
-	if !useWarmWorkspace && s3Sync != nil {
-		data, err := s3Sync.Download(ctx, s3Key)
+	if !useWarmWorkspace && s3Storage != nil {
+		data, err := s3Storage.Download(ctx, s3Key)
 		if err == nil && data != nil {
 			if err := archive.Unarchive(data, chatWorkspaceBase); err == nil {
 				restoredFromS3 = true
@@ -254,22 +336,22 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Sync *aws.S3Sync, ch
 		logger.Info().Str("chat_id", chatID).Msg("No S3 archive found (or reset), wiping local workspace for clean start")
 		_ = os.RemoveAll(chatWorkspaceBase) // Ensure clean state
 		if err := os.MkdirAll(chatWorkspaceBase, 0755); err != nil {
-			return fmt.Errorf("failed to create directory: %w", err)
+			return false, fmt.Errorf("failed to create directory: %w", err)
 		}
 		if err := assets.RestoreWorkspace(chatWorkspaceBase); err != nil {
-			return fmt.Errorf("failed to restore embedded workspace: %w", err)
+			return false, fmt.Errorf("failed to restore embedded workspace: %w", err)
 		}
 		// Fresh workspace doesn't have a version in S3 yet
 		_ = os.Remove(localVersionFile)
 	}
 
 	if err := os.MkdirAll(mainWorkspace, 0o755); err != nil {
-		return fmt.Errorf("failed to create main workspace: %w", err)
+		return false, fmt.Errorf("failed to create main workspace: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(chatWorkspaceBase, "memory"), 0o755); err != nil {
-		return fmt.Errorf("failed to create memory directory: %w", err)
+		return false, fmt.Errorf("failed to create memory directory: %w", err)
 	}
-	return nil
+	return !restoredFromS3, nil
 }
 
 func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance, error) {
@@ -280,7 +362,7 @@ func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance,
 	}
 
 	agentID := "main"
-	var agentCfg *pcfg.AgentConfig
+	var agentCfg *config.AgentConfig
 	for i := range globalConfig.Agents.List {
 		if globalConfig.Agents.List[i].ID == agentID {
 			agentCfg = &globalConfig.Agents.List[i]
@@ -289,7 +371,7 @@ func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance,
 	}
 
 	if agentCfg == nil {
-		agentCfg = &pcfg.AgentConfig{ID: agentID, Default: true}
+		agentCfg = &config.AgentConfig{ID: agentID, Default: true}
 	}
 
 	requestAgentCfg := *agentCfg
@@ -311,7 +393,7 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 	defer cancelOut()
 
 	sendResponse := func(msg bus.OutboundMessage) {
-		if err := a.Channel.Send(ctx, msg); err != nil {
+		if _, err := a.Channel.Send(ctx, msg); err != nil {
 			logger.Error().Err(err).Str("chat_id", msg.ChatID).Msg("Failed to send response")
 		}
 	}
@@ -327,7 +409,7 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 				}
 			case msg, ok := <-a.Bus.OutboundMediaChan():
 				if ok {
-					if err := a.Channel.SendMedia(ctx, msg); err != nil {
+					if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
 						logger.Error().Err(err).Msg("Failed to send media")
 					}
 				}
@@ -384,23 +466,51 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 	return err, modified
 }
 
-func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Sync *aws.S3Sync, chatID, chatWorkspaceBase string) {
-	if s3Sync == nil {
+func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspaceBase string) {
+	if s3Storage == nil {
 		return
 	}
 	logger := log.Ctx(ctx)
 	s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
 
 	if archiveData, err := archive.Archive(chatWorkspaceBase); err == nil {
-		if err := s3Sync.Upload(ctx, s3Key, archiveData); err != nil {
+		if err := s3Storage.Upload(ctx, s3Key, archiveData); err != nil {
 			logger.Warn().Err(err).Str("key", s3Key).Msg("Failed to upload workspace to S3")
 		} else {
 			// Update local .version with new S3 state to ensure next warm hit knows we are fresh
-			if meta, err := s3Sync.GetMetadata(ctx, s3Key); err == nil && meta != nil {
+			if meta, err := s3Storage.GetMetadata(ctx, s3Key); err == nil && meta != nil {
 				localVersionFile := filepath.Join(chatWorkspaceBase, ".version")
 				_ = os.WriteFile(localVersionFile, []byte(meta.ETag), 0o644)
 			}
 		}
 	}
 	// We DO NOT RemoveAll here anymore to persist /tmp for the next warm invocation.
+}
+
+func (a *WorkerApp) initUserMetadata(mainWorkspace string, inMsg *bus.InboundMessage) {
+	if inMsg == nil || inMsg.Sender.DisplayName == "" && inMsg.Sender.Username == "" {
+		return // No sender info available (e.g. heartbeat)
+	}
+	userFile := filepath.Join(mainWorkspace, "USER.md")
+
+	// Only initialize if the file is still a skeleton or missing
+	data, err := os.ReadFile(userFile)
+	if err == nil && !strings.Contains(string(data), "(optional)") && !strings.Contains(string(data), "goes here") {
+		return // Already personalized or modified
+	}
+
+	var sb strings.Builder
+	sb.WriteString("# User\n\n")
+	sb.WriteString("## Personal Information\n")
+	if inMsg.Sender.DisplayName != "" {
+		sb.WriteString(fmt.Sprintf("- Name: %s\n", inMsg.Sender.DisplayName))
+	}
+	if inMsg.Sender.Username != "" {
+		sb.WriteString(fmt.Sprintf("- Username: @%s\n", inMsg.Sender.Username))
+	}
+
+	if lang, ok := inMsg.Context.Raw["language_code"]; ok && lang != "" {
+		sb.WriteString(fmt.Sprintf("- Language: %s\n", lang))
+	}
+	_ = os.WriteFile(userFile, []byte(sb.String()), 0o644)
 }

@@ -52,7 +52,7 @@ func TranslateUpdate(ctx context.Context, bot *telego.Bot, update telego.Update,
 
 	// Calculate composite IDs for forums and groups
 	compositeChatID := buildCompositeChatID(message)
-	peerKind, peerID := buildPeerInfo(message, compositeChatID)
+	peerKind, _ := buildPeerInfo(message, compositeChatID)
 
 	metadata := buildMetadata(user, message, threadID(message))
 
@@ -61,18 +61,31 @@ func TranslateUpdate(ctx context.Context, bot *telego.Bot, update telego.Update,
 		content = stripBotMention(content, botUsername)
 	}
 
-	return &bus.InboundMessage{
-		Channel:    "telegram",
-		SenderID:   sender.CanonicalID,
+	inMsg := &bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel:   "telegram",
+			ChatID:    compositeChatID,
+			ChatType:  peerKind,
+			SenderID:  sender.CanonicalID,
+			MessageID: messageIDStr,
+			Raw:       metadata,
+		},
 		Sender:     sender,
-		ChatID:     compositeChatID,
 		Content:    content,
 		Media:      mediaPaths,
-		Peer:       bus.Peer{Kind: peerKind, ID: peerID},
+		SessionKey: compositeChatID,
+		Channel:    "telegram",
+		SenderID:   sender.CanonicalID,
+		ChatID:     compositeChatID,
 		MessageID:  messageIDStr,
 		MediaScope: scope,
-		Metadata:   metadata,
-	}, nil
+	}
+
+	if message.Chat.IsForum && message.MessageThreadID != 0 {
+		inMsg.Context.TopicID = fmt.Sprintf("%d", message.MessageThreadID)
+	}
+
+	return inMsg, nil
 }
 
 // Internal helper functions to keep TranslateUpdate clean
