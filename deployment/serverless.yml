@@ -10,7 +10,7 @@ provider:
   profile: ${opt:profile, env:AWS_PROFILE, 'default'}
   deploymentBucket: ${env:DEPLOYMENT_BUCKET}
   environment:
-    PICOCLAW_HOME: /tmp/picoclaw
+    PICOCLAW_HOME: /tmp/home
     PICOCLAW_WORKSPACE_BUCKET: !Ref WorkspacesBucket
     LOG_LEVEL: ${env:LOG_LEVEL, "debug"}
     QUEUE_URL: !Ref UpdatesQueue
@@ -45,13 +45,13 @@ functions:
     package:
       artifact: ../build/tg-webhook-lambda.zip
     url: true
-    memorySize: 256
+    memorySize: 128
 
   worker:
     handler: bootstrap
     package:
       artifact: ../build/tg-worker-lambda.zip
-    timeout: 900 # 15 minutes
+    timeout: 300 # 5 minutes
     memorySize: 512
     environment:
       PATH: /var/task/assets/bin:/var/task/assets/python/bin:/opt/bin:/usr/local/bin:/usr/bin:/bin
@@ -92,4 +92,4 @@ resources:
         QueueName: picoclaw-updates-queue.fifo
         FifoQueue: true
         ContentBasedDeduplication: true
-        VisibilityTimeout: 900 # Must be >= Lambda timeout
+        VisibilityTimeout: 330 # Must be > Lambda timeout (300s) + buffer

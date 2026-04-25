@@ -119,6 +119,14 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 	for iteration < inst.MaxIterations {
 		iteration++
 
+		// Check for soft timeout (leave 10s for the final LLM summary or graceful exit)
+		if deadline, ok := ctx.Deadline(); ok {
+			if time.Until(deadline) < 10*time.Second {
+				log.Ctx(ctx).Warn().Msg("Soft timeout reached, stopping iterations")
+				break
+			}
+		}
+
 		providerToolDefs := inst.Tools.ToProviderDefs()
 
 		llmOpts := map[string]any{
@@ -127,7 +135,25 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 			"prompt_cache_key": inst.ID,
 		}
 
-		response, err := inst.Provider.Chat(ctx, messages, providerToolDefs, activeModel, llmOpts)
+		// Inject dynamic time hint to help agent plan its iterations
+		iterMessages := messages
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline).Round(time.Second)
+			hint := fmt.Sprintf("System: Remaining time: %s.", remaining)
+			if remaining < 20*time.Second {
+				hint += " Time is CRITICAL. Wrap up and provide the final answer NOW."
+			} else {
+				hint += " Plan your tool calls accordingly."
+			}
+			
+			iterMessages = append([]providers.Message{}, messages...)
+			iterMessages = append(iterMessages, providers.Message{
+				Role:    "system",
+				Content: hint,
+			})
+		}
+
+		response, err := inst.Provider.Chat(ctx, iterMessages, providerToolDefs, activeModel, llmOpts)
 		if err != nil {
 			return "", iteration, fmt.Errorf("LLM call failed: %w", err)
 		}

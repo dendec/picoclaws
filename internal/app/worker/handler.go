@@ -452,7 +452,13 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 	}
 
 	processTimeout := 3 * time.Minute
-	if t, err := time.ParseDuration(os.Getenv("WORKER_PROCESS_TIMEOUT")); err == nil {
+	if deadline, ok := ctx.Deadline(); ok {
+		// Reserve 30 seconds for graceful shutdown and S3 persistence
+		remaining := time.Until(deadline) - 30*time.Second
+		if remaining > 0 {
+			processTimeout = remaining
+		}
+	} else if t, err := time.ParseDuration(os.Getenv("WORKER_PROCESS_TIMEOUT")); err == nil {
 		processTimeout = t
 	}
 	processCtx, cancel := context.WithTimeout(ctx, processTimeout)
