@@ -36,6 +36,7 @@ type WorkerApp struct {
 	Bot        *telego.Bot
 	MediaStore media.MediaStore
 	BaseDir    string
+	initPyPath string
 }
 
 type HeartbeatMessage struct {
@@ -44,13 +45,22 @@ type HeartbeatMessage struct {
 }
 
 func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
-	// Prepend bundled binaries to PATH so tools (like exec) can find BusyBox applets
+	// Prepend bundled binaries to PATH so tools (like exec) can find BusyBox applets and Python
 	currentPath := os.Getenv("PATH")
 	assetsBin, _ := filepath.Abs("assets/bin")
+	assetsPythonBin, _ := filepath.Abs("assets/python/bin")
+
+	newPath := currentPath
 	if _, err := os.Stat(assetsBin); err == nil {
-		os.Setenv("PATH", assetsBin+":"+currentPath)
-		log.Ctx(ctx).Debug().Str("path", os.Getenv("PATH")).Msg("Updated PATH with bundled binaries")
+		newPath = assetsBin + ":" + newPath
 	}
+	if _, err := os.Stat(assetsPythonBin); err == nil {
+		newPath = assetsPythonBin + ":" + newPath
+	}
+	os.Setenv("PATH", newPath)
+	log.Ctx(ctx).Debug().Str("path", os.Getenv("PATH")).Msg("Updated PATH with bundled binaries")
+
+	initPyPath := os.Getenv("PYTHONPATH")
 
 	baseDir := os.Getenv("PICOCLAW_HOME")
 	if baseDir == "" {
@@ -135,6 +145,7 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 		Bot:        bot,
 		MediaStore: mediaStore,
 		BaseDir:    baseDir,
+		initPyPath: initPyPath,
 	}, nil
 }
 
@@ -206,7 +217,29 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		return err
 	}
 
-	// 2. Check for heartbeat tasks (AFTER workspace is ready on disk)
+	// 2. Setup isolated Python environment inside workspace
+	pythonPackagesDir := filepath.Join(chatWorkspaceBase, ".python_packages")
+	_ = os.MkdirAll(pythonPackagesDir, 0755)
+
+	// Set environment variables for the agent and its tools
+	os.Setenv("HOME", chatWorkspaceBase)
+	os.Setenv("PIP_TARGET", pythonPackagesDir)
+	os.Setenv("PIP_NO_CACHE_DIR", "1")
+
+	// Prepend workspace packages to PYTHONPATH
+	newPyPath := pythonPackagesDir
+	if a.initPyPath != "" {
+		newPyPath = pythonPackagesDir + ":" + a.initPyPath
+	}
+	os.Setenv("PYTHONPATH", newPyPath)
+
+	logger.Debug().
+		Str("home", os.Getenv("HOME")).
+		Str("pythonpath", os.Getenv("PYTHONPATH")).
+		Str("pip_target", os.Getenv("PIP_TARGET")).
+		Msg("Isolated environment configured for workspace")
+
+	// 3. Check for heartbeat tasks (AFTER workspace is ready on disk)
 	if isHeartbeat {
 		prompt := a.buildHeartbeatPrompt(ctx, chatID)
 		if prompt == "" {
@@ -273,13 +306,8 @@ If there is nothing that requires attention, respond ONLY with: HEARTBEAT_OK
 // like /reset to nudge the agent behaviorally via system instructions.
 func (a *WorkerApp) handleSpecialCommands(ctx context.Context, inMsg *bus.InboundMessage) {
 	if strings.TrimSpace(inMsg.Content) == "/reset" {
-		lang := inMsg.Context.Raw["language_code"]
-		if lang == "" {
-			lang = "en" // fallback
-		}
-		inMsg.Content = fmt.Sprintf("System: The user has just reset your memory and workspace. "+
-			"Greet them briefly in your characteristic witty style and confirm that you are ready to start fresh from a clean slate. "+
-			"Respond in the user's language (language_code: %s).", lang)
+		inMsg.Content = "System: The user has just reset your memory and workspace. " +
+			"Greet them briefly according to your personality."
 		log.Ctx(ctx).Info().Msg("Special command /reset processed as system nudge")
 	}
 }

@@ -9,51 +9,59 @@ import (
 	"path/filepath"
 )
 
-// DefaultWorkspace holds the initial workspace skeleton ( IDENTITY.md, SOUL.md, skills/, etc. )
-//
 //go:embed all:skeleton
-var DefaultWorkspace embed.FS
+var privateWorkspace embed.FS
 
-// RestoreWorkspace extracts the embedded workspace files into a destination directory.
+//go:embed all:skeleton_default
+var publicWorkspace embed.FS
+
+// RestoreWorkspace extracts the embedded workspace, prioritizing "skeleton" if present.
 func RestoreWorkspace(destDir string) error {
-	return fs.WalkDir(DefaultWorkspace, "skeleton", func(path string, d fs.DirEntry, err error) error {
+	sourceFS := privateWorkspace
+	sourcePrefix := "skeleton"
+
+	isPrivateEmpty := true
+	_ = fs.WalkDir(privateWorkspace, "skeleton", func(path string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && filepath.Ext(path) == ".md" {
+			isPrivateEmpty = false
+			return filepath.SkipDir
+		}
+		return nil
+	})
+
+	if isPrivateEmpty {
+		sourceFS = publicWorkspace
+		sourcePrefix = "skeleton_default"
+	}
+
+	return fs.WalkDir(sourceFS, sourcePrefix, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 
-		// Create the relative path from the root of "skeleton"
-		relPath, err := filepath.Rel("skeleton", path)
-		if err != nil {
-			return err
-		}
-
-		// Skip the root "skeleton" directory itself
+		relPath, _ := filepath.Rel(sourcePrefix, path)
 		if relPath == "." {
 			return nil
 		}
 
 		targetPath := filepath.Join(destDir, relPath)
-
 		if d.IsDir() {
 			return os.MkdirAll(targetPath, 0o755)
 		}
 
-		// Regular file
-		data, err := DefaultWorkspace.ReadFile(path)
+		data, err := sourceFS.ReadFile(path)
 		if err != nil {
-			return fmt.Errorf("failed to read embedded file %s: %w", path, err)
+			return fmt.Errorf("read %s: %w", path, err)
 		}
 
-		// Ensure parent directory exists (just in case)
-		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
-			return err
-		}
-
+		_ = os.MkdirAll(filepath.Dir(targetPath), 0o755)
 		return os.WriteFile(targetPath, data, 0o644)
 	})
 }
 
-// RestoreWorkspaceToReader extracts the embedded workspace as a reader (optional, if needed)
 func RestoreWorkspaceToReader(path string) (io.Reader, error) {
-	return DefaultWorkspace.Open(filepath.Join("skeleton", path))
+	if r, err := privateWorkspace.Open(filepath.Join("skeleton", path)); err == nil {
+		return r, nil
+	}
+	return publicWorkspace.Open(filepath.Join("skeleton_default", path))
 }

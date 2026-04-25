@@ -52,7 +52,7 @@ functions:
     package:
       artifact: ../build/tg-worker-lambda.zip
     timeout: 900 # 15 minutes
-    memorySize: 256
+    memorySize: 512
     environment:
       PATH: /var/task/assets/bin:/var/task/assets/python/bin:/opt/bin:/usr/local/bin:/usr/bin:/bin
       PYTHONHOME: /var/task/assets/python
@@ -92,4 +92,4 @@ resources:
         QueueName: picoclaw-updates-queue.fifo
         FifoQueue: true
         ContentBasedDeduplication: true
-        VisibilityTimeout: 300 # Must be >= Lambda timeout
+        VisibilityTimeout: 900 # Must be >= Lambda timeout

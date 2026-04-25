@@ -5,3 +5,8 @@ pyyaml
 defusedxml
 httpx
 tenacity
+python-dateutil
+jinja2
+pip
+setuptools
+wheel
