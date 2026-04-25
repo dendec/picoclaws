@@ -27,6 +27,8 @@ import (
 	plog "github.com/sipeed/picoclaw/pkg/logger"
 )
 
+// WorkerApp manages the lifecycle of a worker instance, handling
+// workspace preparation, agent execution, and message processing.
 type WorkerApp struct {
 	Agent      *agent.AgentLoop
 	Channel    *telegram.TelegramChannel
@@ -160,24 +162,18 @@ func (a *WorkerApp) processRecord(ctx context.Context, record events.SQSMessage,
 	// 2. Create Isolated Agent
 	agentInst, err := a.createAgent(chatWorkspaceBase)
 	if err != nil {
-		return err
+		return fmt.Errorf("create agent: %w", err)
 	}
 	defer agentInst.Close()
 
-	// 3. Translate Update
+	// 3. Translate Update into agent-readable message
 	inMsg, err := tgutil.TranslateUpdate(ctx, a.Bot, update, a.MediaStore, "")
 	if err != nil {
 		return fmt.Errorf("translate update: %w", err)
 	}
 
-	// 3.1. System Nudge for /reset command
-	if strings.TrimSpace(inMsg.Content) == "/reset" {
-		lang := inMsg.Metadata["language_code"]
-		if lang == "" {
-			lang = "en" // fallback
-		}
-		inMsg.Content = fmt.Sprintf("System: The user has just reset your memory and workspace. Greet them briefly in your characteristic witty style and confirm that you are ready to start fresh from a clean slate. Respond in the user's language (language_code: %s).", lang)
-	}
+	// 3.1. Handle special system commands (e.g., /reset)
+	a.handleSpecialCommands(ctx, inMsg)
 
 	// 4. Execute Turn
 	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspaceBase)
@@ -192,12 +188,30 @@ func (a *WorkerApp) processRecord(ctx context.Context, record events.SQSMessage,
 	return processErr
 }
 
+// handleSpecialCommands processes incoming messages for specific triggers
+// like /reset to nudge the agent behaviorally via system instructions.
+func (a *WorkerApp) handleSpecialCommands(ctx context.Context, inMsg *bus.InboundMessage) {
+	if strings.TrimSpace(inMsg.Content) == "/reset" {
+		lang := inMsg.Metadata["language_code"]
+		if lang == "" {
+			lang = "en" // fallback
+		}
+		inMsg.Content = fmt.Sprintf("System: The user has just reset your memory and workspace. "+
+			"Greet them briefly in your characteristic witty style and confirm that you are ready to start fresh from a clean slate. "+
+			"Respond in the user's language (language_code: %s).", lang)
+		log.Ctx(ctx).Info().Msg("Special command /reset processed as system nudge")
+	}
+}
+
+// getWorkspacePaths calculates the base and main workspace paths for a given chat.
 func (a *WorkerApp) getWorkspacePaths(chatID string) (string, string) {
 	chatWorkspaceBase := filepath.Join(a.BaseDir, "chats", chatID)
 	mainWorkspace := filepath.Join(chatWorkspaceBase, "main")
 	return chatWorkspaceBase, mainWorkspace
 }
 
+// prepareWorkspace ensures the local environment is ready for the agent to work in.
+// It syncs from S3 if needed and restores default assets for fresh workspaces.
 func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Sync *aws.S3Sync, chatID, chatWorkspaceBase, mainWorkspace string) error {
 	logger := log.Ctx(ctx)
 	s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)

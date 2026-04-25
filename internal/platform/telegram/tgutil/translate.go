@@ -16,140 +16,49 @@ import (
 )
 
 // TranslateUpdate converts a telego.Update into a bus.InboundMessage.
-// It replicates the logic from the official picoclaw telegram channel but adapted for single-shot execution.
+// It replicates the core logic from the official picoclaw telegram channel,
+// adapted for single-shot serverless execution.
 func TranslateUpdate(ctx context.Context, bot *telego.Bot, update telego.Update, mediaStore media.MediaStore, botUsername string) (*bus.InboundMessage, error) {
-	message := extractMessage(update)
+	message := ExtractMessage(update)
 	if message == nil {
-		return nil, fmt.Errorf("no message in update")
+		return nil, fmt.Errorf("no message found in update: %v", update.UpdateID)
 	}
 
 	user := message.From
 	if user == nil {
-		return nil, fmt.Errorf("message sender (user) is nil")
+		return nil, fmt.Errorf("message sender is missing")
 	}
 
-	platformID := fmt.Sprintf("%d", user.ID)
-	sender := bus.SenderInfo{
-		Platform:    "telegram",
-		PlatformID:  platformID,
-		CanonicalID: identity.BuildCanonicalID("telegram", platformID),
-		Username:    user.Username,
-		DisplayName: user.FirstName,
-	}
-
-	chatID := message.Chat.ID
-	chatIDStr := fmt.Sprintf("%d", chatID)
+	sender := buildSenderInfo(user)
+	chatIDStr := fmt.Sprintf("%d", message.Chat.ID)
 	messageIDStr := fmt.Sprintf("%d", message.MessageID)
 	scope := channels.BuildMediaScope("telegram", chatIDStr, messageIDStr)
 
-	content := ""
-	mediaPaths := []string{}
+	// Combine Text and Caption
+	content := joinTextAndCaption(message.Text, message.Caption)
 
-	// Helper to register a local file with the media store
-	storeMedia := func(localPath, filename string) string {
-		if mediaStore != nil {
-			ref, err := mediaStore.Store(localPath, media.MediaMeta{
-				Filename: filename,
-				Source:   "telegram",
-			}, scope)
-			if err == nil {
-				return ref
-			}
-		}
-		return localPath
-	}
-
-	if message.Text != "" {
-		content += message.Text
-	}
-	if message.Caption != "" {
+	// Process all media types
+	mediaPaths, mediaDesc := processMedia(ctx, bot, message, mediaStore, scope)
+	if mediaDesc != "" {
 		if content != "" {
 			content += "\n"
 		}
-		content += message.Caption
-	}
-
-	// Handle Media
-	if len(message.Photo) > 0 {
-		photo := message.Photo[len(message.Photo)-1]
-		photoPath, _ := downloadPhoto(ctx, bot, photo.FileID)
-		if photoPath != "" {
-			mediaPaths = append(mediaPaths, storeMedia(photoPath, "photo.jpg"))
-			if content != "" {
-				content += "\n"
-			}
-			content += "[image: photo]"
-		}
-	}
-
-	if message.Voice != nil {
-		voicePath, _ := downloadFile(ctx, bot, message.Voice.FileID, ".ogg")
-		if voicePath != "" {
-			mediaPaths = append(mediaPaths, storeMedia(voicePath, "voice.ogg"))
-			if content != "" {
-				content += "\n"
-			}
-			content += "[voice]"
-		}
-	}
-
-	if message.Audio != nil {
-		audioPath, _ := downloadFile(ctx, bot, message.Audio.FileID, ".mp3")
-		if audioPath != "" {
-			mediaPaths = append(mediaPaths, storeMedia(audioPath, "audio.mp3"))
-			if content != "" {
-				content += "\n"
-			}
-			content += "[audio]"
-		}
-	}
-
-	if message.Document != nil {
-		docPath, _ := downloadFile(ctx, bot, message.Document.FileID, "")
-		if docPath != "" {
-			mediaPaths = append(mediaPaths, storeMedia(docPath, message.Document.FileName))
-			if content != "" {
-				content += "\n"
-			}
-			content += "[file]"
-		}
+		content += mediaDesc
 	}
 
 	if content == "" {
 		content = "[empty message]"
 	}
 
-	// Forum topic handling
-	compositeChatID := chatIDStr
-	threadID := message.MessageThreadID
-	if message.Chat.IsForum && threadID != 0 {
-		compositeChatID = fmt.Sprintf("%d/%d", chatID, threadID)
-	}
+	// Calculate composite IDs for forums and groups
+	compositeChatID := buildCompositeChatID(message)
+	peerKind, peerID := buildPeerInfo(message, compositeChatID)
 
-	// Mention stripping for groups
-	if message.Chat.Type != "private" {
-		if isBotMentioned(message, botUsername) {
-			content = stripBotMention(content, botUsername)
-		}
-	}
+	metadata := buildMetadata(user, message, threadID(message))
 
-	peerKind := "direct"
-	peerID := fmt.Sprintf("%d", user.ID)
-	if message.Chat.Type != "private" {
-		peerKind = "group"
-		peerID = compositeChatID
-	}
-
-	metadata := map[string]string{
-		"user_id":       fmt.Sprintf("%d", user.ID),
-		"username":      user.Username,
-		"first_name":    user.FirstName,
-		"language_code": user.LanguageCode,
-		"is_group":      fmt.Sprintf("%t", message.Chat.Type != "private"),
-	}
-	if message.Chat.IsForum && threadID != 0 {
-		metadata["parent_peer_kind"] = "topic"
-		metadata["parent_peer_id"] = fmt.Sprintf("%d", threadID)
+	// Stripping bot mentions in groups
+	if message.Chat.Type != "private" && isBotMentioned(message, botUsername) {
+		content = stripBotMention(content, botUsername)
 	}
 
 	return &bus.InboundMessage{
@@ -166,7 +75,112 @@ func TranslateUpdate(ctx context.Context, bot *telego.Bot, update telego.Update,
 	}, nil
 }
 
-func extractMessage(update telego.Update) *telego.Message {
+// Internal helper functions to keep TranslateUpdate clean
+
+func buildSenderInfo(user *telego.User) bus.SenderInfo {
+	platformID := fmt.Sprintf("%d", user.ID)
+	return bus.SenderInfo{
+		Platform:    "telegram",
+		PlatformID:  platformID,
+		CanonicalID: identity.BuildCanonicalID("telegram", platformID),
+		Username:    user.Username,
+		DisplayName: user.FirstName,
+	}
+}
+
+func joinTextAndCaption(text, caption string) string {
+	if text == "" {
+		return caption
+	}
+	if caption == "" {
+		return text
+	}
+	return text + "\n" + caption
+}
+
+func buildCompositeChatID(m *telego.Message) string {
+	id := fmt.Sprintf("%d", m.Chat.ID)
+	if m.Chat.IsForum && m.MessageThreadID != 0 {
+		return fmt.Sprintf("%d/%d", m.Chat.ID, m.MessageThreadID)
+	}
+	return id
+}
+
+func buildPeerInfo(m *telego.Message, compositeID string) (string, string) {
+	if m.Chat.Type == "private" {
+		return "direct", fmt.Sprintf("%d", m.From.ID)
+	}
+	return "group", compositeID
+}
+
+func threadID(m *telego.Message) int {
+	return m.MessageThreadID
+}
+
+func buildMetadata(user *telego.User, m *telego.Message, threadID int) map[string]string {
+	meta := map[string]string{
+		"user_id":       fmt.Sprintf("%d", user.ID),
+		"username":      user.Username,
+		"first_name":    user.FirstName,
+		"language_code": user.LanguageCode,
+		"is_group":      fmt.Sprintf("%t", m.Chat.Type != "private"),
+	}
+	if m.Chat.IsForum && threadID != 0 {
+		meta["parent_peer_kind"] = "topic"
+		meta["parent_peer_id"] = fmt.Sprintf("%d", threadID)
+	}
+	return meta
+}
+
+func processMedia(ctx context.Context, bot *telego.Bot, m *telego.Message, store media.MediaStore, scope string) ([]string, string) {
+	var paths []string
+	var descParts []string
+
+	// Local helper to store and append
+	add := func(localPath, filename, desc string) {
+		if localPath == "" {
+			return
+		}
+		finalPath := localPath
+		if store != nil {
+			if ref, err := store.Store(localPath, media.MediaMeta{Filename: filename, Source: "telegram"}, scope); err == nil {
+				finalPath = ref
+			}
+		}
+		paths = append(paths, finalPath)
+		descParts = append(descParts, desc)
+	}
+
+	// 1. Photos
+	if len(m.Photo) > 0 {
+		p := m.Photo[len(m.Photo)-1]
+		local, _ := downloadPhoto(ctx, bot, p.FileID)
+		add(local, "photo.jpg", "[image: photo]")
+	}
+
+	// 2. Voice
+	if m.Voice != nil {
+		local, _ := downloadFile(ctx, bot, m.Voice.FileID, ".ogg")
+		add(local, "voice.ogg", "[voice]")
+	}
+
+	// 3. Audio
+	if m.Audio != nil {
+		local, _ := downloadFile(ctx, bot, m.Audio.FileID, ".mp3")
+		add(local, "audio.mp3", "[audio]")
+	}
+
+	// 4. Documents
+	if m.Document != nil {
+		local, _ := downloadFile(ctx, bot, m.Document.FileID, "")
+		add(local, m.Document.FileName, "[file]")
+	}
+
+	return paths, strings.Join(descParts, "\n")
+}
+
+// ExtractMessage retrieves the message object from different update types (message, edited, callback).
+func ExtractMessage(update telego.Update) *telego.Message {
 	if update.Message != nil {
 		return update.Message
 	}
