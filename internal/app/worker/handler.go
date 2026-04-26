@@ -134,6 +134,7 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 	tgChan.SetRunning(true)
 
 	mediaStore := media.NewFileMediaStore()
+	tgChan.SetMediaStore(mediaStore)
 
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
 	agentLoop.SetMediaStore(mediaStore)
@@ -405,7 +406,9 @@ func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance,
 	requestAgentCfg := *agentCfg
 	requestAgentCfg.Workspace = chatWorkspaceBase
 
-	return agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider), nil
+	inst := agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider)
+	a.EquipAgent(inst)
+	return inst, nil
 }
 
 func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInstance, inMsg *bus.InboundMessage, chatWorkspaceBase string) (error, bool) {

@@ -2,7 +2,7 @@
   "agents": {
     "defaults": {
       "model_name": "gemini-2.0-flash",
-      "workspace": "/tmp/picoclaw/workspace"
+      "workspace": "/tmp/home/workspace"
     }
   },
   "model_list": [
@@ -19,6 +19,7 @@
     }
   },
   "tools": {
+    "allow_read_paths": [],
     "web": {
       "enabled": true
     },
