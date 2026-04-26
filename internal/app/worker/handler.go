@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"picoclaws/internal/pkg/archive"
@@ -444,12 +445,17 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 
 	// 1. Create a timestamp marker to detect CHANGES in the workspace
 	markerFile := filepath.Join(os.TempDir(), fmt.Sprintf("marker_%d", time.Now().UnixNano()))
-	_ = os.WriteFile(markerFile, []byte("start"), 0o644)
+	if f, err := os.OpenFile(markerFile, os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		_, _ = f.WriteString("start")
+		_ = f.Sync() // Ensure it's on disk with current timestamp
+		f.Close()
+	}
 	defer os.Remove(markerFile)
 
 	// Outbound collection
+	var wg sync.WaitGroup
 	outCtx, cancelOut := context.WithCancel(ctx)
-	defer cancelOut()
+	// We don't defer cancelOut here because we want to control the shutdown sequence below
 
 	sendResponse := func(msg bus.OutboundMessage) {
 		if _, err := a.Channel.Send(ctx, msg); err != nil {
@@ -457,10 +463,31 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		}
 	}
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-outCtx.Done():
+				// FINAL DRAIN: Try to get any remaining messages sent after agent finished
+				for {
+					select {
+					case msg, ok := <-a.Bus.OutboundChan():
+						if ok {
+							sendResponse(msg)
+							continue
+						}
+					case msg, ok := <-a.Bus.OutboundMediaChan():
+						if ok {
+							if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
+								logger.Error().Err(err).Msg("Failed to send media")
+							}
+							continue
+						}
+					default:
+					}
+					break
+				}
 				return
 			case msg, ok := <-a.Bus.OutboundChan():
 				if ok {
@@ -515,11 +542,17 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		SuppressReasoning:    strings.ToLower(os.Getenv("PICOCLAW_SUPPRESS_REASONING")) != "false",
 	})
 
-	time.Sleep(500 * time.Millisecond) // Drain bus
+	// Wait for a small grace period to allow any last-second async messages to enter the bus
+	time.Sleep(100 * time.Millisecond)
+
+	// Shutdown the collector and wait for final drain
+	cancelOut()
+	wg.Wait()
 
 	// 2. SMART DETECTOR: Check if workspace was modified
 	modified := true // Default to true for safety
 	cmd := exec.CommandContext(ctx, "find", chatWorkspaceBase, "-newer", markerFile)
+	cmd.Env = a.buildEnv()
 	output, findErr := cmd.Output()
 	if findErr == nil {
 		// If output is empty, nothing was changed
@@ -529,6 +562,26 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 	}
 
 	return err, modified
+}
+
+func (a *WorkerApp) buildEnv() []string {
+	env := os.Environ()
+	// Filter out existing HOME, PYTHONPATH, etc. to avoid duplicates
+	filtered := make([]string, 0, len(env))
+	for _, e := range env {
+		if !strings.HasPrefix(e, "HOME=") &&
+			!strings.HasPrefix(e, "PYTHONPATH=") &&
+			!strings.HasPrefix(e, "PIP_TARGET=") &&
+			!strings.HasPrefix(e, "PIP_NO_CACHE_DIR=") {
+			filtered = append(filtered, e)
+		}
+	}
+
+	filtered = append(filtered, "HOME="+os.Getenv("HOME"))
+	filtered = append(filtered, "PYTHONPATH="+os.Getenv("PYTHONPATH"))
+	filtered = append(filtered, "PIP_TARGET="+os.Getenv("PIP_TARGET"))
+	filtered = append(filtered, "PIP_NO_CACHE_DIR="+os.Getenv("PIP_NO_CACHE_DIR"))
+	return filtered
 }
 
 func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspaceBase string) {

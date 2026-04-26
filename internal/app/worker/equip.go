@@ -2,13 +2,16 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/sipeed/picoclaw/pkg/agent"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/session"
 	"github.com/sipeed/picoclaw/pkg/tools"
@@ -164,7 +167,14 @@ func buildAllowReadPatterns(cfg *config.Config) []*regexp.Regexp {
 		configured = cfg.Tools.AllowReadPaths
 	}
 
-	compiled := compilePatterns(configured)
+	compiled, err := compilePatterns(configured)
+	if err != nil {
+		// Log error but continue with what we have
+		logger.ErrorCF("worker", "Failed to compile some allow_read_paths", map[string]any{
+			"error": err.Error(),
+		})
+	}
+
 	mediaDirPattern := regexp.MustCompile(mediaTempDirPattern())
 	for _, pattern := range compiled {
 		if pattern.String() == mediaDirPattern.String() {
@@ -175,16 +185,21 @@ func buildAllowReadPatterns(cfg *config.Config) []*regexp.Regexp {
 	return append(compiled, mediaDirPattern)
 }
 
-func compilePatterns(patterns []string) []*regexp.Regexp {
+func compilePatterns(patterns []string) ([]*regexp.Regexp, error) {
 	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	var errs []string
 	for _, p := range patterns {
 		re, err := regexp.Compile(p)
 		if err != nil {
+			errs = append(errs, fmt.Sprintf("%q: %v", p, err))
 			continue
 		}
 		compiled = append(compiled, re)
 	}
-	return compiled
+	if len(errs) > 0 {
+		return compiled, fmt.Errorf("regex compilation errors: %s", strings.Join(errs, "; "))
+	}
+	return compiled, nil
 }
 
 func mediaTempDirPattern() string {
