@@ -500,7 +500,7 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		defer stopTyping()
 	}
 
-	_, err := driver.RunAgent(processCtx, agentInst, processOptions{
+	_, err := driver.RunAgent(agent.WithTurnContext(processCtx, a.Agent, agentInst), agentInst, processOptions{
 		SessionKey:           inMsg.ChatID,
 		Channel:              "telegram",
 		ChatID:               inMsg.ChatID,

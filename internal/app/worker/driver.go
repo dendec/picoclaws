@@ -76,7 +76,7 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 3. Run LLM iteration loop
-	finalContent, iteration, sentMessages, err := d.runIteration(ctx, inst, messages, opts)
+	finalContent, iteration, sentMessages, totalUsage, err := d.runIteration(ctx, inst, messages, opts)
 	if err != nil {
 		return "", err
 	}
@@ -115,17 +115,18 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 		Str("chat_id", opts.ChatID).
 		Str("session_key", opts.SessionKey).
 		Int("iterations", iteration).
-		Int("content_len", len(finalContent)).
+		Interface("usage", totalUsage).
 		Str("response", finalContent).
 		Msg("Agent processing complete")
 
 	return finalContent, nil
 }
 
-func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, messages []providers.Message, opts processOptions) (string, int, []string, error) {
+func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, messages []providers.Message, opts processOptions) (string, int, []string, map[string]providers.UsageInfo, error) {
 	iteration := 0
 	var finalContent string
 	var sentMessages []string
+	totalUsage := make(map[string]providers.UsageInfo)
 
 	// Simple active model selection (ignore routing for now, or implement if needed)
 	activeModel := inst.Model
@@ -169,7 +170,27 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 
 		response, err := inst.Provider.Chat(ctx, iterMessages, providerToolDefs, activeModel, llmOpts)
 		if err != nil {
-			return "", iteration, sentMessages, fmt.Errorf("LLM call failed: %w", err)
+			return "", iteration, sentMessages, totalUsage, fmt.Errorf("LLM call failed: %w", err)
+		}
+		
+		// Accumulate and log usage for this iteration
+		if response.Usage != nil {
+			u := totalUsage[activeModel]
+			u.PromptTokens += response.Usage.PromptTokens
+			u.CompletionTokens += response.Usage.CompletionTokens
+			u.CachedTokens += response.Usage.CachedTokens
+			u.TotalTokens += response.Usage.TotalTokens
+			totalUsage[activeModel] = u
+
+			log.Ctx(ctx).Info().
+				Str("chat_id", opts.ChatID).
+				Str("model", activeModel).
+				Int("iteration", iteration).
+				Int("prompt_tokens", response.Usage.PromptTokens).
+				Int("completion_tokens", response.Usage.CompletionTokens).
+				Int("cached_tokens", response.Usage.CachedTokens).
+				Int("total_tokens", response.Usage.TotalTokens).
+				Msg("Iteration usage")
 		}
 
 		// Handle reasoning (async best-effort)
@@ -326,7 +347,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 		inst.Tools.TickTTL()
 	}
 
-	return finalContent, iteration, sentMessages, nil
+	return finalContent, iteration, sentMessages, totalUsage, nil
 }
 
 func (d *Driver) resolveMediaRefs(messages []providers.Message, maxSize int64) []providers.Message {
