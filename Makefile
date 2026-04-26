@@ -1,4 +1,4 @@
-.PHONY: all build-lambdas clean help
+.PHONY: all build-lambdas clean help test
 
 # Build variables
 BUILD_DIR=build
@@ -79,8 +79,13 @@ clean-deps:
 	@echo "Cleaning Python dependencies..."
 	@rm -rf $(PYTHON_TARGET)/*
 
+## test: Run all Go tests
+test:
+	@echo "Running Go tests..."
+	$(GO) test -v ./...
+
 ## build-lambdas: Build all PicoClAWS Lambdas for AWS (Linux/ARM64)
-build-lambdas: download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda build-tg-heartbeat-lambda
+build-lambdas: test download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda build-tg-heartbeat-lambda
 
 ## build-tg-webhook-lambda: Build the Telegram Webhook Lambda for AWS
 build-tg-webhook-lambda:
@@ -133,6 +138,7 @@ help:
 	@echo "  make [target]"
 	@echo ""
 	@echo "Targets:"
+	@echo "  test                Run all Go tests"
 	@echo "  build-lambdas       Build and zip all lambdas"
 	@echo "  deploy              Build and deploy to AWS"
 	@echo "  clean               Remove build artifacts"

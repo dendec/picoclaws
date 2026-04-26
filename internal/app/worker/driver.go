@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -75,7 +76,7 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
 	// 3. Run LLM iteration loop
-	finalContent, iteration, err := d.runIteration(ctx, inst, messages, opts)
+	finalContent, iteration, sentMessages, err := d.runIteration(ctx, inst, messages, opts)
 	if err != nil {
 		return "", err
 	}
@@ -89,7 +90,19 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	inst.Sessions.Save(opts.SessionKey)
 
 	// 5. Send response via bus if requested
-	if opts.SendResponse {
+	// Suppress if message was already sent via tool AND final content is redundant
+	suppress := false
+	for _, m := range sentMessages {
+		if isRedundant(m, finalContent) {
+			suppress = true
+			break
+		}
+	}
+	if !suppress && len(sentMessages) > 0 && (finalContent == "" || finalContent == opts.DefaultResponse) {
+		suppress = true
+	}
+	
+	if opts.SendResponse && !suppress {
 		_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
 			Channel: opts.Channel,
 			ChatID:  opts.ChatID,
@@ -109,9 +122,10 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	return finalContent, nil
 }
 
-func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, messages []providers.Message, opts processOptions) (string, int, error) {
+func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, messages []providers.Message, opts processOptions) (string, int, []string, error) {
 	iteration := 0
 	var finalContent string
+	var sentMessages []string
 
 	// Simple active model selection (ignore routing for now, or implement if needed)
 	activeModel := inst.Model
@@ -155,7 +169,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 
 		response, err := inst.Provider.Chat(ctx, iterMessages, providerToolDefs, activeModel, llmOpts)
 		if err != nil {
-			return "", iteration, fmt.Errorf("LLM call failed: %w", err)
+			return "", iteration, sentMessages, fmt.Errorf("LLM call failed: %w", err)
 		}
 
 		// Handle reasoning (async best-effort)
@@ -255,6 +269,16 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				Bool("is_error", r.res.IsError).
 				Bool("silent", r.res.Silent).
 				Msg("Tool result")
+			
+			if r.tc.Name == "message" {
+				var args struct {
+					Content string `json:"content"`
+				}
+				_ = json.Unmarshal([]byte(r.tc.Function.Arguments), &args)
+				if args.Content != "" {
+					sentMessages = append(sentMessages, args.Content)
+				}
+			}
 
 			// Immediate feedback for user if not silent and not suppressed
 			if !opts.SuppressToolFeedback && !r.res.Silent && r.res.ForUser != "" {
@@ -302,7 +326,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 		inst.Tools.TickTTL()
 	}
 
-	return finalContent, iteration, nil
+	return finalContent, iteration, sentMessages, nil
 }
 
 func (d *Driver) resolveMediaRefs(messages []providers.Message, maxSize int64) []providers.Message {
@@ -363,4 +387,37 @@ func (d *Driver) encodeFileToBase64(path string, maxSize int64) (string, error) 
 
 	encoded := "data:" + mime + ";base64," + strings.TrimSpace(base64.StdEncoding.EncodeToString(data))
 	return encoded, nil
+}
+
+func isRedundant(original, final string) bool {
+	origWords := getWords(original)
+	finalWords := getWords(final)
+	if len(finalWords) == 0 {
+		return true
+	}
+
+	matches := 0
+	for fw := range finalWords {
+		if origWords[fw] {
+			matches++
+		}
+	}
+
+	// If more than 80% of words in the final response are already in the original
+	overlap := float64(matches) / float64(len(finalWords))
+	return overlap > 0.8
+}
+
+func getWords(s string) map[string]bool {
+	s = strings.ToLower(s)
+	reg := regexp.MustCompile(`[a-z0-9а-яё]+`)
+	words := reg.FindAllString(s, -1)
+	
+	wordSet := make(map[string]bool)
+	for _, w := range words {
+		if len(w) > 1 { // Ignore single letters/digits
+			wordSet[w] = true
+		}
+	}
+	return wordSet
 }

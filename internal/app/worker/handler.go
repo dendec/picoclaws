@@ -310,7 +310,35 @@ func (a *WorkerApp) handleSpecialCommands(ctx context.Context, inMsg *bus.Inboun
 		inMsg.Content = "System: The user has just reset your memory and workspace. " +
 			"Greet them briefly according to your personality."
 		log.Ctx(ctx).Info().Msg("Special command /reset processed as system nudge")
+
+		// Execute physical reset
+		if err := a.resetWorkspace(ctx, inMsg.Context.ChatID); err != nil {
+			log.Ctx(ctx).Error().Err(err).Msg("Failed to reset workspace")
+		}
 	}
+}
+
+// resetWorkspace physically deletes the local workspace and S3 archive.
+func (a *WorkerApp) resetWorkspace(ctx context.Context, chatID string) error {
+	chatWorkspaceBase, _ := a.getWorkspacePaths(chatID)
+	log.Ctx(ctx).Info().Str("chat_id", chatID).Msg("Performing physical workspace reset")
+
+	// 1. Wipe local
+	_ = os.RemoveAll(chatWorkspaceBase)
+
+	// 2. Wipe S3 if configured
+	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
+	if bucket != "" {
+		s3Storage, err := aws.NewS3Storage(ctx, bucket)
+		if err != nil {
+			return fmt.Errorf("s3 storage init: %w", err)
+		}
+		s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
+		if err := s3Storage.Delete(ctx, s3Key); err != nil {
+			log.Ctx(ctx).Warn().Err(err).Str("key", s3Key).Msg("Failed to delete S3 archive during reset")
+		}
+	}
+	return nil
 }
 
 // getWorkspacePaths calculates the base and main workspace paths for a given chat.
@@ -362,7 +390,7 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	}
 
 	if !restoredFromS3 {
-		logger.Info().Str("chat_id", chatID).Msg("No S3 archive found (or reset), wiping local workspace for clean start")
+		logger.Info().Str("chat_id", chatID).Msg("No S3 archive found, wiping local workspace for clean start")
 		_ = os.RemoveAll(chatWorkspaceBase) // Ensure clean state
 		if err := os.MkdirAll(chatWorkspaceBase, 0755); err != nil {
 			return false, fmt.Errorf("failed to create directory: %w", err)
