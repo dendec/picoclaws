@@ -22,11 +22,11 @@ func TestWorkspaceLifecycle(t *testing.T) {
 	}
 
 	chatID := "test-user-123"
-	chatWorkspaceBase, mainWorkspace := app.getWorkspacePaths(chatID)
+	chatWorkspace := app.getWorkspacePath(chatID)
 
 	t.Run("InitialPrepare", func(t *testing.T) {
 		// Should create directories and restore assets
-		isNew, err := app.prepareWorkspace(ctx, nil, chatID, chatWorkspaceBase, mainWorkspace)
+		isNew, err := app.prepareWorkspace(ctx, nil, chatID, chatWorkspace)
 		if err != nil {
 			t.Errorf("prepareWorkspace failed: %v", err)
 		}
@@ -34,13 +34,13 @@ func TestWorkspaceLifecycle(t *testing.T) {
 			t.Error("expected isNew to be true for first-time prepare")
 		}
 
-		// Check if directories exist
-		if _, err := os.Stat(mainWorkspace); err != nil {
-			t.Errorf("main workspace not created: %v", err)
+		// Check if directory exists
+		if _, err := os.Stat(chatWorkspace); err != nil {
+			t.Errorf("chat workspace not created: %v", err)
 		}
 		
 		// Check if a known asset is restored (assuming MEMORY.md is in skeleton)
-		memoryFile := filepath.Join(chatWorkspaceBase, "memory", "MEMORY.md")
+		memoryFile := filepath.Join(chatWorkspace, "memory", "MEMORY.md")
 		if _, err := os.Stat(memoryFile); err != nil {
 			t.Errorf("assets not restored to %s: %v", memoryFile, err)
 		}
@@ -48,7 +48,7 @@ func TestWorkspaceLifecycle(t *testing.T) {
 
 	t.Run("ResetWorkspace", func(t *testing.T) {
 		// Add a dummy file to workspace
-		dummyFile := filepath.Join(mainWorkspace, "dummy.txt")
+		dummyFile := filepath.Join(chatWorkspace, "dummy.txt")
 		_ = os.WriteFile(dummyFile, []byte("data"), 0644)
 
 		// Reset
@@ -58,14 +58,14 @@ func TestWorkspaceLifecycle(t *testing.T) {
 		}
 
 		// Verify deletion
-		if _, err := os.Stat(chatWorkspaceBase); err == nil {
-			t.Error("chat workspace base should have been deleted")
+		if _, err := os.Stat(chatWorkspace); err == nil {
+			t.Error("chat workspace should have been deleted")
 		}
 	})
 
 	t.Run("PrepareAfterReset", func(t *testing.T) {
 		// Should restore everything again
-		isNew, err := app.prepareWorkspace(ctx, nil, chatID, chatWorkspaceBase, mainWorkspace)
+		isNew, err := app.prepareWorkspace(ctx, nil, chatID, chatWorkspace)
 		if err != nil {
 			t.Errorf("prepareWorkspace failed after reset: %v", err)
 		}
@@ -73,8 +73,8 @@ func TestWorkspaceLifecycle(t *testing.T) {
 			t.Error("expected isNew to be true after reset")
 		}
 		
-		if _, err := os.Stat(mainWorkspace); err != nil {
-			t.Error("main workspace should be recreated")
+		if _, err := os.Stat(chatWorkspace); err != nil {
+			t.Error("chat workspace should be recreated")
 		}
 	})
 }

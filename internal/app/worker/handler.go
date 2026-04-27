@@ -237,20 +237,20 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		}
 	}
 
-	chatWorkspaceBase, mainWorkspace := a.getWorkspacePaths(chatID)
+	chatWorkspace := a.getWorkspacePath(chatID)
 
 	// 1. Prepare Workspace (S3 + Assets)
-	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspaceBase, mainWorkspace)
+	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	if err != nil {
 		return err
 	}
 
 	// 2. Setup isolated Python environment inside workspace
-	pythonPackagesDir := filepath.Join(chatWorkspaceBase, ".python_packages")
+	pythonPackagesDir := filepath.Join(chatWorkspace, ".python_packages")
 	_ = os.MkdirAll(pythonPackagesDir, 0755)
 
 	// Set environment variables for the agent and its tools
-	os.Setenv("HOME", chatWorkspaceBase)
+	os.Setenv("HOME", chatWorkspace)
 	os.Setenv("PIP_TARGET", pythonPackagesDir)
 	os.Setenv("PIP_NO_CACHE_DIR", "1")
 
@@ -277,21 +277,21 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		inMsg.Content = prompt
 	}
 
-	// 3. Create Isolated Agent
-	agentInst, err := a.createAgent(chatWorkspaceBase)
+	// 4. Create Isolated Agent
+	agentInst, err := a.createAgent(chatWorkspace)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
 	defer agentInst.Close()
 
-	// 4. Initialize USER.md for fresh workspaces
+	// 5. Initialize USER.md for fresh workspaces
 	if isNew {
-		a.initUserMetadata(mainWorkspace, inMsg)
+		a.initUserMetadata(chatWorkspace, inMsg)
 	}
 
-	// 5. Materialize inbound media into workspace inbox
+	// 6. Materialize inbound media into workspace inbox
 	if len(inMsg.Media) > 0 {
-		inboxDir := filepath.Join(chatWorkspaceBase, "inbox")
+		inboxDir := filepath.Join(chatWorkspace, "inbox")
 		_ = os.MkdirAll(inboxDir, 0755)
 		for _, ref := range inMsg.Media {
 			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
@@ -332,12 +332,12 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		}
 	}
 
-	// 6. Execute Turn
-	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspaceBase)
+	// 7. Execute Turn
+	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspace)
 
-	// 6. Finalize Workspace (S3 + Cleanup)
+	// 8. Finalize Workspace (S3 + Cleanup)
 	if modified {
-		a.finalizeWorkspace(ctx, s3Storage, chatID, chatWorkspaceBase)
+		a.finalizeWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	} else {
 		logger.Info().Msg("Workspace unchanged, skipping S3 upload")
 	}
@@ -346,8 +346,8 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 }
 
 func (a *WorkerApp) buildHeartbeatPrompt(ctx context.Context, chatID string) string {
-	_, mainWorkspace := a.getWorkspacePaths(chatID)
-	heartbeatPath := filepath.Join(mainWorkspace, "HEARTBEAT.md")
+	chatWorkspace := a.getWorkspacePath(chatID)
+	heartbeatPath := filepath.Join(chatWorkspace, "HEARTBEAT.md")
 
 	data, err := os.ReadFile(heartbeatPath)
 	if err != nil {
@@ -390,11 +390,11 @@ func (a *WorkerApp) handleSpecialCommands(ctx context.Context, inMsg *bus.Inboun
 
 // resetWorkspace physically deletes the local workspace and S3 archive.
 func (a *WorkerApp) resetWorkspace(ctx context.Context, chatID string) error {
-	chatWorkspaceBase, _ := a.getWorkspacePaths(chatID)
+	chatWorkspace := a.getWorkspacePath(chatID)
 	log.Ctx(ctx).Info().Str("chat_id", chatID).Msg("Performing physical workspace reset")
 
 	// 1. Wipe local
-	_ = os.RemoveAll(chatWorkspaceBase)
+	_ = os.RemoveAll(chatWorkspace)
 
 	// 2. Wipe S3 if configured
 	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
@@ -411,21 +411,19 @@ func (a *WorkerApp) resetWorkspace(ctx context.Context, chatID string) error {
 	return nil
 }
 
-// getWorkspacePaths calculates the base and main workspace paths for a given chat.
-func (a *WorkerApp) getWorkspacePaths(chatID string) (string, string) {
-	chatWorkspaceBase := filepath.Join(a.BaseDir, "chats", chatID)
-	mainWorkspace := filepath.Join(chatWorkspaceBase, "main")
-	return chatWorkspaceBase, mainWorkspace
+// getWorkspacePath calculates the base workspace path for a given chat.
+func (a *WorkerApp) getWorkspacePath(chatID string) string {
+	return filepath.Join(a.BaseDir, "chats", chatID)
 }
 
 // prepareWorkspace ensures the local environment is ready for the agent to work in.
 // It syncs from S3 if needed and restores default assets for fresh workspaces.
 // Returns true if the workspace was initialized from scratch (assets restored).
-func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspaceBase, mainWorkspace string) (bool, error) {
+func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspace string) (bool, error) {
 	logger := log.Ctx(ctx)
 	s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
 
-	localVersionFile := filepath.Join(chatWorkspaceBase, ".version")
+	localVersionFile := filepath.Join(chatWorkspace, ".version")
 
 	// 1. Check S3 Metadata (ETag/LastModified)
 	var s3Meta *aws.S3Metadata
@@ -437,7 +435,7 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 
 	// 2. Performance: If /tmp folder exists, compare with S3 metadata
 	useWarmWorkspace := false
-	if _, err := os.Stat(chatWorkspaceBase); err == nil && s3Meta != nil {
+	if _, err := os.Stat(chatWorkspace); err == nil && s3Meta != nil {
 		if verData, err := os.ReadFile(localVersionFile); err == nil {
 			if string(verData) == s3Meta.ETag {
 				logger.Info().Str("chat_id", chatID).Msg("Reusing warm workspace from /tmp; skipping S3 download")
@@ -450,7 +448,7 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	if !useWarmWorkspace && s3Storage != nil {
 		data, err := s3Storage.Download(ctx, s3Key)
 		if err == nil && data != nil {
-			if err := archive.Unarchive(data, chatWorkspaceBase); err == nil {
+			if err := archive.Unarchive(data, chatWorkspace); err == nil {
 				restoredFromS3 = true
 				if s3Meta != nil {
 					_ = os.WriteFile(localVersionFile, []byte(s3Meta.ETag), 0o644)
@@ -461,27 +459,25 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 
 	if !restoredFromS3 {
 		logger.Info().Str("chat_id", chatID).Msg("No S3 archive found, wiping local workspace for clean start")
-		_ = os.RemoveAll(chatWorkspaceBase) // Ensure clean state
-		if err := os.MkdirAll(chatWorkspaceBase, 0755); err != nil {
+		_ = os.RemoveAll(chatWorkspace) // Ensure clean state
+		if err := os.MkdirAll(chatWorkspace, 0755); err != nil {
 			return false, fmt.Errorf("failed to create directory: %w", err)
 		}
-		if err := assets.RestoreWorkspace(chatWorkspaceBase); err != nil {
+		if err := assets.RestoreWorkspace(chatWorkspace); err != nil {
 			return false, fmt.Errorf("failed to restore embedded workspace: %w", err)
 		}
 		// Fresh workspace doesn't have a version in S3 yet
 		_ = os.Remove(localVersionFile)
 	}
 
-	if err := os.MkdirAll(mainWorkspace, 0o755); err != nil {
-		return false, fmt.Errorf("failed to create main workspace: %w", err)
-	}
-	if err := os.MkdirAll(filepath.Join(chatWorkspaceBase, "memory"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(chatWorkspace, "memory"), 0o755); err != nil {
 		return false, fmt.Errorf("failed to create memory directory: %w", err)
 	}
+
 	return !restoredFromS3, nil
 }
 
-func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance, error) {
+func (a *WorkerApp) createAgent(workspacePath string) (*agent.AgentInstance, error) {
 	globalConfig := a.Agent.GetConfig()
 	defaultAgent := a.Agent.GetRegistry().GetDefaultAgent()
 	if defaultAgent == nil {
@@ -502,7 +498,7 @@ func (a *WorkerApp) createAgent(chatWorkspaceBase string) (*agent.AgentInstance,
 	}
 
 	requestAgentCfg := *agentCfg
-	requestAgentCfg.Workspace = chatWorkspaceBase
+	requestAgentCfg.Workspace = workspacePath
 
 	inst := agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider)
 	a.EquipAgent(inst)
@@ -653,20 +649,20 @@ func (a *WorkerApp) buildEnv() []string {
 	return filtered
 }
 
-func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspaceBase string) {
+func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Storage *aws.S3Storage, chatID, chatWorkspace string) {
 	if s3Storage == nil {
 		return
 	}
 	logger := log.Ctx(ctx)
 	s3Key := fmt.Sprintf("workspaces/%s.tar.zst", chatID)
 
-	if archiveData, err := archive.Archive(chatWorkspaceBase); err == nil {
+	if archiveData, err := archive.Archive(chatWorkspace); err == nil {
 		if err := s3Storage.Upload(ctx, s3Key, archiveData); err != nil {
 			logger.Warn().Err(err).Str("key", s3Key).Msg("Failed to upload workspace to S3")
 		} else {
 			// Update local .version with new S3 state to ensure next warm hit knows we are fresh
 			if meta, err := s3Storage.GetMetadata(ctx, s3Key); err == nil && meta != nil {
-				localVersionFile := filepath.Join(chatWorkspaceBase, ".version")
+				localVersionFile := filepath.Join(chatWorkspace, ".version")
 				_ = os.WriteFile(localVersionFile, []byte(meta.ETag), 0o644)
 			}
 		}
@@ -674,11 +670,11 @@ func (a *WorkerApp) finalizeWorkspace(ctx context.Context, s3Storage *aws.S3Stor
 	// We DO NOT RemoveAll here anymore to persist /tmp for the next warm invocation.
 }
 
-func (a *WorkerApp) initUserMetadata(mainWorkspace string, inMsg *bus.InboundMessage) {
+func (a *WorkerApp) initUserMetadata(workspace string, inMsg *bus.InboundMessage) {
 	if inMsg == nil || inMsg.Sender.DisplayName == "" && inMsg.Sender.Username == "" {
 		return // No sender info available (e.g. heartbeat)
 	}
-	userFile := filepath.Join(mainWorkspace, "USER.md")
+	userFile := filepath.Join(workspace, "USER.md")
 
 	// Only initialize if the file is still a skeleton or missing
 	data, err := os.ReadFile(userFile)
