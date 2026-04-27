@@ -64,6 +64,6 @@ make deploy
 
 - `cmd/`: Entry points for Webhook and Worker Lambdas.
 - `internal/app/`: Core application logic (Worker driver, Telegram handlers).
-- `internal/pkg/`: Shared utilities (Archive, Assets management).
+- `internal/`: Shared utilities (Archive, Assets management, Transcriber).
 - `assets/`: Bundled binaries and Python dependencies (populated during build).
 - `deployment/`: Serverless configuration and infrastructure as code.

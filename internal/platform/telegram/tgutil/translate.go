@@ -186,7 +186,7 @@ func processMedia(ctx context.Context, bot *telego.Bot, m *telego.Message, store
 	// 4. Documents
 	if m.Document != nil {
 		local, _ := downloadFile(ctx, bot, m.Document.FileID, "")
-		add(local, m.Document.FileName, "[file]")
+		add(local, m.Document.FileName, fmt.Sprintf("[file in inbox/%s]", m.Document.FileName))
 	}
 
 	return paths, strings.Join(descParts, "\n")

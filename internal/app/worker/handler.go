@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,8 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"picoclaws/internal/pkg/archive"
-	"picoclaws/internal/pkg/assets"
+	"picoclaws/internal/archive"
+	"picoclaws/internal/assets"
+	"picoclaws/internal/transcriber"
 	"picoclaws/internal/platform/aws"
 	"picoclaws/internal/platform/telegram/tgutil"
 
@@ -35,8 +37,9 @@ type WorkerApp struct {
 	Channel    *telegram.TelegramChannel
 	Bus        *bus.MessageBus
 	Bot        *telego.Bot
-	MediaStore media.MediaStore
-	BaseDir    string
+	MediaStore  media.MediaStore
+	Transcriber *transcriber.WhisperTranscriber
+	BaseDir     string
 	initPyPath string
 }
 
@@ -140,14 +143,20 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
 	agentLoop.SetMediaStore(mediaStore)
 
+	tr, err := transcriber.NewTranscriber(cfg, mediaStore)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to initialize transcriber (voice messages will not be transcribed)")
+	}
+
 	return &WorkerApp{
-		Agent:      agentLoop,
-		Channel:    tgChan,
-		Bus:        msgBus,
-		Bot:        bot,
-		MediaStore: mediaStore,
-		BaseDir:    baseDir,
-		initPyPath: initPyPath,
+		Agent:       agentLoop,
+		Channel:     tgChan,
+		Bus:         msgBus,
+		Bot:         bot,
+		MediaStore:  mediaStore,
+		Transcriber: tr,
+		BaseDir:     baseDir,
+		initPyPath:  initPyPath,
 	}, nil
 }
 
@@ -189,6 +198,23 @@ func (a *WorkerApp) processSQSRecord(ctx context.Context, record events.SQSMessa
 	inMsg, err := tgutil.TranslateUpdate(ctx, a.Bot, update, a.MediaStore, "")
 	if err != nil {
 		return fmt.Errorf("translate update: %w", err)
+	}
+
+	// Automatic Transcription
+	if a.Transcriber != nil && len(inMsg.Media) > 0 {
+		for _, ref := range inMsg.Media {
+			if strings.HasSuffix(strings.ToLower(ref), ".ogg") {
+				path, _, _ := a.MediaStore.ResolveWithMeta(ref)
+				if res, err := a.Transcriber.Transcribe(ctx, path); err == nil && res.Text != "" {
+					log.Ctx(ctx).Info().Str("transcript", res.Text).Msg("Voice transcribed successfully")
+					if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
+						inMsg.Content = res.Text
+					} else {
+						inMsg.Content = fmt.Sprintf("%s\n\n[voice: %s]", inMsg.Content, res.Text)
+					}
+				}
+			}
+		}
 	}
 
 	// Handle special system commands (e.g., /reset)
@@ -263,7 +289,50 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		a.initUserMetadata(mainWorkspace, inMsg)
 	}
 
-	// 5. Execute Turn
+	// 5. Materialize inbound media into workspace inbox
+	if len(inMsg.Media) > 0 {
+		inboxDir := filepath.Join(chatWorkspaceBase, "inbox")
+		_ = os.MkdirAll(inboxDir, 0755)
+		for _, ref := range inMsg.Media {
+			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
+			if err != nil {
+				logger.Warn().Err(err).Str("ref", ref).Msg("Failed to resolve media ref for inbox")
+				continue
+			}
+			
+			destName := meta.Filename
+			if destName == "" {
+				destName = filepath.Base(path)
+			}
+			destPath := filepath.Join(inboxDir, destName)
+			
+			// Copy file from media store to inbox
+			err = func() error {
+				src, err := os.Open(path)
+				if err != nil {
+					return err
+				}
+				defer src.Close()
+				
+				dst, err := os.Create(destPath)
+				if err != nil {
+					return err
+				}
+				defer dst.Close()
+				
+				_, err = io.Copy(dst, src)
+				return err
+			}()
+			
+			if err != nil {
+				logger.Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
+			} else {
+				logger.Debug().Str("file", destName).Msg("Media materialized in inbox")
+			}
+		}
+	}
+
+	// 6. Execute Turn
 	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspaceBase)
 
 	// 6. Finalize Workspace (S3 + Cleanup)

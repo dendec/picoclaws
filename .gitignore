@@ -27,4 +27,4 @@ deployment/node_modules/
 .vscode/
 .idea/
 .go_cache/
-internal/pkg/assets/skeleton/
+internal/assets/skeleton/

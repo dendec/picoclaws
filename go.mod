@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sqs v1.42.25
 	github.com/klauspost/compress v1.18.5
 	github.com/mymmrac/telego v1.8.0
+	github.com/openai/openai-go/v3 v3.22.0
 	github.com/rs/zerolog v1.35.0
 	github.com/sipeed/picoclaw v0.2.7
 )
@@ -55,7 +56,6 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.5.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/openai/openai-go/v3 v3.22.0 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/rtp v1.10.1 // indirect
 	github.com/pion/webrtc/v3 v3.3.6 // indirect

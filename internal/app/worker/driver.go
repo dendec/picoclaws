@@ -50,6 +50,10 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	history := inst.Sessions.GetHistory(opts.SessionKey)
 	summary := inst.Sessions.GetSummary(opts.SessionKey)
 
+	if len(opts.Media) > 0 {
+		opts.UserMessage += "\n\n(Use tools for inbox/ files)"
+	}
+
 	messages := inst.ContextBuilder.BuildMessages(
 		history,
 		summary,
