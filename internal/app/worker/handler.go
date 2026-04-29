@@ -14,9 +14,9 @@ import (
 
 	"picoclaws/internal/archive"
 	"picoclaws/internal/assets"
-	"picoclaws/internal/transcriber"
 	"picoclaws/internal/platform/aws"
 	"picoclaws/internal/platform/telegram/tgutil"
+	"picoclaws/internal/transcriber"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/mymmrac/telego"
@@ -33,14 +33,14 @@ import (
 // WorkerApp manages the lifecycle of a worker instance, handling
 // workspace preparation, agent execution, and message processing.
 type WorkerApp struct {
-	Agent      *agent.AgentLoop
-	Channel    *telegram.TelegramChannel
-	Bus        *bus.MessageBus
-	Bot        *telego.Bot
+	Agent       *agent.AgentLoop
+	Channel     *telegram.TelegramChannel
+	Bus         *bus.MessageBus
+	Bot         *telego.Bot
 	MediaStore  media.MediaStore
 	Transcriber *transcriber.WhisperTranscriber
 	BaseDir     string
-	initPyPath string
+	initPyPath  string
 }
 
 type HeartbeatMessage struct {
@@ -269,12 +269,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 
 	// 3. Check for heartbeat tasks (AFTER workspace is ready on disk)
 	if isHeartbeat {
-		prompt := a.buildHeartbeatPrompt(ctx, chatID)
-		if prompt == "" {
-			logger.Debug().Msg("No heartbeat tasks found, skipping agent execution")
-			return nil
-		}
-		inMsg.Content = prompt
+		inMsg.Content = a.buildHeartbeatPrompt()
 	}
 
 	// 4. Create Isolated Agent
@@ -299,13 +294,13 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 				logger.Warn().Err(err).Str("ref", ref).Msg("Failed to resolve media ref for inbox")
 				continue
 			}
-			
+
 			destName := meta.Filename
 			if destName == "" {
 				destName = filepath.Base(path)
 			}
 			destPath := filepath.Join(inboxDir, destName)
-			
+
 			// Copy file from media store to inbox
 			err = func() error {
 				src, err := os.Open(path)
@@ -313,17 +308,17 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 					return err
 				}
 				defer src.Close()
-				
+
 				dst, err := os.Create(destPath)
 				if err != nil {
 					return err
 				}
 				defer dst.Close()
-				
+
 				_, err = io.Copy(dst, src)
 				return err
 			}()
-			
+
 			if err != nil {
 				logger.Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
 			} else {
@@ -333,7 +328,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	}
 
 	// 7. Execute Turn
-	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspace)
+	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspace, isHeartbeat)
 
 	// 8. Finalize Workspace (S3 + Cleanup)
 	if modified {
@@ -345,32 +340,9 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	return processErr
 }
 
-func (a *WorkerApp) buildHeartbeatPrompt(ctx context.Context, chatID string) string {
-	chatWorkspace := a.getWorkspacePath(chatID)
-	heartbeatPath := filepath.Join(chatWorkspace, "HEARTBEAT.md")
-
-	data, err := os.ReadFile(heartbeatPath)
-	if err != nil {
-		return ""
-	}
-
-	content := string(data)
-	// Check if there are actual tasks (using the same marker as original picoclaw)
-	if !strings.Contains(content, "Add your heartbeat tasks below this line:") {
-		return ""
-	}
-
+func (a *WorkerApp) buildHeartbeatPrompt() string {
 	now := time.Now().Format("2006-01-02 15:04:05")
-	return fmt.Sprintf(`# Heartbeat Check
-
-Current time: %s
-
-You are a proactive AI assistant. This is a scheduled heartbeat check.
-Review the following tasks and execute any necessary actions using available skills.
-If there is nothing that requires attention, respond ONLY with: HEARTBEAT_OK
-
-%s
-`, now, content)
+	return fmt.Sprintf("System: Internal heartbeat check at %s. This is a background task. DO NOT respond directly to the user. Use this time to run tools, monitor logs, or continue ongoing work. If you have nothing to do, simply say 'No tasks'.", now)
 }
 
 // handleSpecialCommands processes incoming messages for specific triggers
@@ -505,7 +477,7 @@ func (a *WorkerApp) createAgent(workspacePath string) (*agent.AgentInstance, err
 	return inst, nil
 }
 
-func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInstance, inMsg *bus.InboundMessage, chatWorkspaceBase string) (error, bool) {
+func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInstance, inMsg *bus.InboundMessage, chatWorkspaceBase string, isHeartbeat bool) (error, bool) {
 	logger := log.Ctx(ctx)
 
 	// 1. Create a timestamp marker to detect CHANGES in the workspace
@@ -600,7 +572,7 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		Media:                inMsg.Media,
 		DefaultResponse:      "Thinking...",
 		EnableSummary:        true,
-		SendResponse:         true,
+		SendResponse:         !isHeartbeat,
 		SenderID:             inMsg.SenderID,
 		SenderDisplayName:    inMsg.Sender.DisplayName,
 		SuppressToolFeedback: strings.ToLower(os.Getenv("PICOCLAW_SUPPRESS_TOOLS")) != "false",
