@@ -91,6 +91,9 @@ func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance) {
 			})
 		})
 		inst.Tools.Register(messageTool)
+
+		// Also register reactions if message tool is enabled
+		inst.Tools.Register(NewReactionTool(a.BotToken))
 	}
 
 	// 3. Media Tools
@@ -157,6 +160,9 @@ func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance) {
 			inst.Tools.Register(tools.NewSpawnStatusTool(subagentManager))
 		}
 	}
+
+	// 5. Dynamic Skills (from workspace /skills directory)
+	a.RegisterSkills(inst)
 }
 
 // Helpers replicated from picoclaw/pkg/agent

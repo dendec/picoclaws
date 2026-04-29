@@ -183,7 +183,8 @@ prune-deps:
 ## clean-deps: Remove installed Python dependencies
 clean-deps:
 	@echo "Cleaning Python dependencies..."
-	@rm -rf $(PYTHON_TARGET)/*
+	@rm -rf $(PYTHON_TARGET)
+	@mkdir -p $(PYTHON_TARGET)
 
 ## test: Run all Go tests
 test:

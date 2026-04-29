@@ -12,8 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rs/zerolog/log"
 	"picoclaws/internal/platform/telegram/tgutil"
+
+	"github.com/rs/zerolog/log"
 	"github.com/sipeed/picoclaw/pkg/agent"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -23,16 +24,17 @@ import (
 )
 
 type processOptions struct {
-	SessionKey      string
-	Channel         string
-	ChatID          string
-	UserMessage        string
-	Media              []string
-	DefaultResponse    string
-	EnableSummary      bool
-	SendResponse       bool
-	SenderID           string
-	SenderDisplayName   string
+	SessionKey           string
+	Channel              string
+	ChatID               string
+	MessageID            string
+	UserMessage          string
+	Media                []string
+	DefaultResponse      string
+	EnableSummary        bool
+	SendResponse         bool
+	SenderID             string
+	SenderDisplayName    string
 	ReasoningChannelID   string
 	SuppressToolFeedback bool
 	SuppressReasoning    bool
@@ -105,13 +107,32 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	if !suppress && len(sentMessages) > 0 && (finalContent == "" || finalContent == opts.DefaultResponse) {
 		suppress = true
 	}
-	
+
+	// Suppress leaked raw tool calls (Gemma/special token artifacts)
+	if strings.Contains(finalContent, "call:exec{") ||
+		strings.Contains(finalContent, "call:message{") ||
+		strings.Contains(finalContent, "call:reaction{") ||
+		strings.Contains(finalContent, "<tool_call|>") ||
+		strings.Contains(finalContent, "<|\"|>") {
+		suppress = true
+	}
+
 	if opts.SendResponse && !suppress {
-		_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
-			Channel: opts.Channel,
-			ChatID:  opts.ChatID,
-			Content: finalContent,
-		})
+		// Clean up reasoning tags if they leaked into the final response
+		cleanContent := finalContent
+		if strings.Contains(cleanContent, "<thought") {
+			re := regexp.MustCompile(`(?s)<thought.*?>.*?</thought>|<thought.*?>`)
+			cleanContent = re.ReplaceAllString(cleanContent, "")
+			cleanContent = strings.TrimSpace(cleanContent)
+		}
+
+		if cleanContent != "" {
+			_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: cleanContent,
+			})
+		}
 	}
 
 	log.Ctx(ctx).Info().
@@ -135,8 +156,12 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 	// Simple active model selection (ignore routing for now, or implement if needed)
 	activeModel := inst.Model
 
-	for iteration < inst.MaxIterations {
+	for {
 		iteration++
+		if iteration > inst.MaxIterations {
+			log.Ctx(ctx).Warn().Int("iterations", iteration).Msg("Max iterations reached")
+			break
+		}
 
 		// Check for soft timeout (leave 10s for the final LLM summary or graceful exit)
 		if deadline, ok := ctx.Deadline(); ok {
@@ -164,7 +189,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 			} else {
 				hint += " Plan your tool calls accordingly."
 			}
-			
+
 			iterMessages = append([]providers.Message{}, messages...)
 			iterMessages = append(iterMessages, providers.Message{
 				Role:    "system",
@@ -176,7 +201,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 		if err != nil {
 			return "", iteration, sentMessages, totalUsage, fmt.Errorf("LLM call failed: %w", err)
 		}
-		
+
 		// Accumulate and log usage for this iteration
 		if response.Usage != nil {
 			u := totalUsage[activeModel]
@@ -249,8 +274,9 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				ThoughtSignature: tcNorm.ThoughtSignature,
 			})
 		}
+
+		// Add to local history for the next generation in THIS turn
 		messages = append(messages, assistantMsg)
-		inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
 
 		// Log tool calls
 		for _, tc := range assistantMsg.ToolCalls {
@@ -277,13 +303,18 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				defer wg.Done()
 				var args map[string]any
 				_ = json.Unmarshal([]byte(t.Function.Arguments), &args)
-				res := inst.Tools.ExecuteWithContext(ctx, t.Name, args, opts.Channel, opts.ChatID, nil)
+				// Manually inject message context since picoclaw library doesn't do it in ExecuteWithContext
+				toolCtx := tools.WithToolInboundContext(ctx, opts.Channel, opts.ChatID, opts.MessageID, "")
+				res := inst.Tools.ExecuteWithContext(toolCtx, t.Name, args, opts.Channel, opts.ChatID, nil)
 				results[idx] = result{idx: idx, res: res, tc: t}
 			}(i, tc)
 		}
 		wg.Wait()
 
-		// Handle results
+		// Save Assistant message to session ONLY after we have results ready to follow it
+		inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+
+		// Handle and save results
 		for _, r := range results {
 			// Always log tool results to system log
 			log.Ctx(ctx).Info().
@@ -294,7 +325,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				Bool("is_error", r.res.IsError).
 				Bool("silent", r.res.Silent).
 				Msg("Tool result")
-			
+
 			if r.tc.Name == "message" {
 				var args struct {
 					Content string `json:"content"`
@@ -437,7 +468,7 @@ func getWords(s string) map[string]bool {
 	s = strings.ToLower(s)
 	reg := regexp.MustCompile(`[a-z0-9а-яё]+`)
 	words := reg.FindAllString(s, -1)
-	
+
 	wordSet := make(map[string]bool)
 	for _, w := range words {
 		if len(w) > 1 { // Ignore single letters/digits

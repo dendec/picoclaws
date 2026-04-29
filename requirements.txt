@@ -20,3 +20,4 @@ fpdf2
 html2text
 loguru
 pydantic
+piexif

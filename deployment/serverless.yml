@@ -58,6 +58,7 @@ functions:
       PYTHONHOME: /var/task/assets/python
       PYTHONPATH: /var/task/assets/python/lib/python3.12/site-packages
       LD_LIBRARY_PATH: /var/task/assets/python/lib
+      API_KEY: ${env:API_KEY}
     events:
       - sqs:
           arn: !GetAtt UpdatesQueue.Arn

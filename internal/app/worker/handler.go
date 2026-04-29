@@ -40,6 +40,7 @@ type WorkerApp struct {
 	MediaStore  media.MediaStore
 	Transcriber *transcriber.WhisperTranscriber
 	BaseDir     string
+	BotToken    string
 	initPyPath  string
 }
 
@@ -155,6 +156,7 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 		Bot:         bot,
 		MediaStore:  mediaStore,
 		Transcriber: tr,
+		BotToken:    tgSettings.Token.String(),
 		BaseDir:     baseDir,
 		initPyPath:  initPyPath,
 	}, nil
@@ -201,20 +203,44 @@ func (a *WorkerApp) processSQSRecord(ctx context.Context, record events.SQSMessa
 	}
 
 	// Automatic Transcription
-	if a.Transcriber != nil && len(inMsg.Media) > 0 {
+	if len(inMsg.Media) > 0 {
+		var newMedia []string
 		for _, ref := range inMsg.Media {
-			if strings.HasSuffix(strings.ToLower(ref), ".ogg") {
-				path, _, _ := a.MediaStore.ResolveWithMeta(ref)
-				if res, err := a.Transcriber.Transcribe(ctx, path); err == nil && res.Text != "" {
-					log.Ctx(ctx).Info().Str("transcript", res.Text).Msg("Voice transcribed successfully")
-					if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
-						inMsg.Content = res.Text
-					} else {
-						inMsg.Content = fmt.Sprintf("%s\n\n[voice: %s]", inMsg.Content, res.Text)
-					}
-				}
+			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
+			if err != nil {
+				newMedia = append(newMedia, ref)
+				continue
 			}
+			
+			if strings.HasSuffix(strings.ToLower(meta.Filename), ".ogg") || strings.HasSuffix(strings.ToLower(meta.Filename), ".mp3") {
+				if a.Transcriber != nil {
+					res, err := a.Transcriber.Transcribe(ctx, path)
+					if err == nil && res.Text != "" {
+						log.Ctx(ctx).Info().Str("transcript", res.Text).Msg("Voice transcribed successfully")
+						if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
+							inMsg.Content = res.Text
+						} else {
+							inMsg.Content = fmt.Sprintf("%s\n\n[voice: %s]", inMsg.Content, res.Text)
+						}
+					} else {
+						errStr := "unknown error"
+						if err != nil {
+							errStr = err.Error()
+						}
+						log.Ctx(ctx).Warn().Str("error", errStr).Msg("Voice transcription failed")
+						if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
+							inMsg.Content = "[Unintelligible voice message]"
+						}
+					}
+				} else {
+					log.Ctx(ctx).Warn().Msg("Voice message received but Transcriber is not configured")
+				}
+				// Don't pass audio to LLM context under ANY circumstances
+				continue
+			}
+			newMedia = append(newMedia, ref)
 		}
+		inMsg.Media = newMedia
 	}
 
 	// Handle special system commands (e.g., /reset)
@@ -288,6 +314,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	if len(inMsg.Media) > 0 {
 		inboxDir := filepath.Join(chatWorkspace, "inbox")
 		_ = os.MkdirAll(inboxDir, 0755)
+		var attachedFiles []string
 		for _, ref := range inMsg.Media {
 			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
 			if err != nil {
@@ -323,7 +350,15 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 				logger.Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
 			} else {
 				logger.Debug().Str("file", destName).Msg("Media materialized in inbox")
+				attachedFiles = append(attachedFiles, destName)
 			}
+		}
+		
+		if len(attachedFiles) > 0 {
+			if inMsg.Content != "" {
+				inMsg.Content += "\n\n"
+			}
+			inMsg.Content += "[System: User attached files in inbox/: " + strings.Join(attachedFiles, ", ") + "]"
 		}
 	}
 
@@ -564,13 +599,22 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		defer stopTyping()
 	}
 
+	userMessage := inMsg.Content
+	if isHeartbeat {
+		heartbeatPath := filepath.Join(chatWorkspaceBase, "HEARTBEAT.md")
+		if data, err := os.ReadFile(heartbeatPath); err == nil {
+			userMessage = string(data)
+		}
+	}
+
 	_, err := driver.RunAgent(agent.WithTurnContext(processCtx, a.Agent, agentInst), agentInst, processOptions{
 		SessionKey:           inMsg.ChatID,
 		Channel:              "telegram",
 		ChatID:               inMsg.ChatID,
-		UserMessage:          inMsg.Content,
+		MessageID:            inMsg.Context.MessageID,
+		UserMessage:          userMessage,
 		Media:                inMsg.Media,
-		DefaultResponse:      "Thinking...",
+		DefaultResponse:      "No tasks",
 		EnableSummary:        true,
 		SendResponse:         !isHeartbeat,
 		SenderID:             inMsg.SenderID,
