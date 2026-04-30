@@ -13,7 +13,7 @@ require (
 	github.com/mymmrac/telego v1.8.0
 	github.com/openai/openai-go/v3 v3.22.0
 	github.com/rs/zerolog v1.35.1
-	github.com/sipeed/picoclaw v0.2.7
+	github.com/sipeed/picoclaw v0.2.8
 )
 
 require (
@@ -91,4 +91,4 @@ require (
 	modernc.org/sqlite v1.48.2 // indirect
 )
 
-replace github.com/sipeed/picoclaw => ../picoclaw
+replace github.com/sipeed/picoclaw => github.com/dendec/picoclaw v0.0.0-20260430115513-cbf97ba62790
