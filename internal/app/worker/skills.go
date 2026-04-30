@@ -37,10 +37,11 @@ func (t *SkillTool) Name() string {
 }
 
 func (t *SkillTool) Description() string {
+	relPath := filepath.Join("skills", filepath.Base(t.skillDir), "SKILL.md")
 	if t.engineScript != "" {
-		return t.description + "\n\nActive skill: Use this tool to run subcommands (e.g., submit, check, download). Detailed instructions are included below."
+		return fmt.Sprintf("%s\n\nActive skill. Detailed instructions: %s. Read it before use.", t.description, relPath)
 	}
-	return t.description + "\n\nInformational skill: Call this tool to see detailed instructions on how to perform these tasks manually using 'exec' or other tools."
+	return fmt.Sprintf("%s\n\nInformational skill. Detailed instructions: %s. Read it to perform tasks manually.", t.description, relPath)
 }
 
 func (t *SkillTool) Parameters() map[string]any {
@@ -264,14 +265,9 @@ func parseSkillMetadata(path string) (string, string, error) {
 	content := string(data)
 	lines := strings.Split(content, "\n")
 	var name, desc string
-	headerEnd := 0
-	for i, line := range lines {
+	for _, line := range lines {
 		if strings.HasPrefix(line, "---") {
-			if i == 0 {
-				continue
-			}
-			headerEnd = i + 1
-			break
+			continue
 		}
 		if strings.HasPrefix(line, "name:") {
 			name = strings.TrimSpace(strings.TrimPrefix(line, "name:"))
@@ -285,16 +281,5 @@ func parseSkillMetadata(path string) (string, string, error) {
 		return "", "", fmt.Errorf("missing name in SKILL.md")
 	}
 
-	// The rest of the file (after ---) contains detailed instructions
-	instructions := ""
-	if headerEnd > 0 && headerEnd < len(lines) {
-		instructions = strings.Join(lines[headerEnd:], "\n")
-	}
-
-	fullDesc := desc
-	if instructions != "" {
-		fullDesc = fmt.Sprintf("%s\n\n## Instructions:\n%s", desc, instructions)
-	}
-
-	return name, fullDesc, nil
+	return name, desc, nil
 }
