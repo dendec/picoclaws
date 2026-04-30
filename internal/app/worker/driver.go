@@ -227,7 +227,6 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 			u := totalUsage[activeModel]
 			u.PromptTokens += response.Usage.PromptTokens
 			u.CompletionTokens += response.Usage.CompletionTokens
-			u.CachedTokens += response.Usage.CachedTokens
 			u.TotalTokens += response.Usage.TotalTokens
 			totalUsage[activeModel] = u
 
@@ -237,7 +236,6 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				Int("iteration", iteration).
 				Int("prompt_tokens", response.Usage.PromptTokens).
 				Int("completion_tokens", response.Usage.CompletionTokens).
-				Int("cached_tokens", response.Usage.CachedTokens).
 				Int("total_tokens", response.Usage.TotalTokens).
 				Msg("Iteration usage")
 		}

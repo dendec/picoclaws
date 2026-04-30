@@ -610,7 +610,6 @@ func (a *WorkerApp) createAgent(chatID string, workspacePath string) (*agent.Age
 	requestAgentCfg.Workspace = workspacePath
 
 	inst := agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider)
-	inst.ContextBuilder.WithDisableSkillsSummary(true)
 	a.EquipAgent(inst, chatID)
 	return inst, nil
 }
@@ -719,7 +718,7 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		sessionKey = "system:heartbeat:" + inMsg.ChatID
 	}
 
-	_, err := driver.RunAgent(agent.WithTurnContext(processCtx, a.Agent, agentInst), agentInst, processOptions{
+	_, err := driver.RunAgent(processCtx, agentInst, processOptions{
 		SessionKey:           sessionKey,
 		Channel:              "telegram",
 		ChatID:               inMsg.ChatID,

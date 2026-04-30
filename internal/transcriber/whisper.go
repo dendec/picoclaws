@@ -53,7 +53,7 @@ func NewTranscriber(cfg *config.Config, store media.MediaStore) (*WhisperTranscr
 	)
 
 	// Extract actual model ID (strip protocol)
-	_, modelID := providers.ExtractProtocol(modelCfg.Model)
+	_, modelID := providers.ExtractProtocol(modelCfg)
 	if modelID == "" {
 		modelID = modelCfg.Model
 	}
