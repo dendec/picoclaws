@@ -38,6 +38,7 @@ type processOptions struct {
 	ReasoningChannelID   string
 	SuppressToolFeedback bool
 	SuppressReasoning    bool
+	DisableHistory       bool
 }
 
 // Driver provides single-shot agent execution logic.
@@ -47,9 +48,17 @@ type Driver struct {
 	Config     *config.Config
 }
 
+const MaxVisibleHistory = 10
+
 func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts processOptions) (string, error) {
 	// 1. Build messages
 	history := inst.Sessions.GetHistory(opts.SessionKey)
+	// Soft-limit history for the LLM prompt
+	// This keeps the prompt small but preserves the full file on disk for tools like grep.
+	llmHistory := history
+	if len(llmHistory) > MaxVisibleHistory {
+		llmHistory = llmHistory[len(llmHistory)-MaxVisibleHistory:]
+	}
 	summary := inst.Sessions.GetSummary(opts.SessionKey)
 
 	if len(opts.Media) > 0 {
@@ -57,7 +66,7 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	}
 
 	messages := inst.ContextBuilder.BuildMessages(
-		history,
+		llmHistory,
 		summary,
 		opts.UserMessage,
 		opts.Media,
@@ -79,7 +88,9 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 		Str("message", opts.UserMessage).
 		Int("media_count", len(opts.Media)).
 		Msg("User message received")
-	inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
+	if !opts.DisableHistory {
+		inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
+	}
 
 	// 3. Run LLM iteration loop
 	finalContent, iteration, sentMessages, totalUsage, err := d.runIteration(ctx, inst, messages, opts)
@@ -92,8 +103,10 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	}
 
 	// 4. Save final assistant message to session
-	inst.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
-	inst.Sessions.Save(opts.SessionKey)
+	if !opts.DisableHistory {
+		inst.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
+		inst.Sessions.Save(opts.SessionKey)
+	}
 
 	// 5. Send response via bus if requested
 	// Suppress if message was already sent via tool AND final content is redundant
@@ -196,6 +209,13 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				Content: hint,
 			})
 		}
+
+		log.Ctx(ctx).Debug().
+			Interface("messages", iterMessages).
+			Interface("tools", providerToolDefs).
+			Str("activeModel", activeModel).
+			Interface("llmOpts", llmOpts).
+			Msg("Sending request to LLM")
 
 		response, err := inst.Provider.Chat(ctx, iterMessages, providerToolDefs, activeModel, llmOpts)
 		if err != nil {
@@ -312,7 +332,9 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 		wg.Wait()
 
 		// Save Assistant message to session ONLY after we have results ready to follow it
-		inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+		if !opts.DisableHistory {
+			inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+		}
 
 		// Handle and save results
 		for _, r := range results {
@@ -376,7 +398,9 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 				ToolCallID: r.tc.ID,
 			}
 			messages = append(messages, toolResultMsg)
-			inst.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+			if !opts.DisableHistory {
+				inst.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+			}
 		}
 
 		inst.Tools.TickTTL()

@@ -19,7 +19,7 @@ import (
 
 // EquipAgent adds shared tools (web, send_file, message, etc.) to an agent instance.
 // This is a local implementation moved from the picoclaw library to allow customization.
-func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance) {
+func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance, chatID string) {
 	cfg := a.Agent.GetConfig()
 	msgBus := a.Bus
 	allowReadPaths := buildAllowReadPatterns(cfg)
@@ -162,7 +162,7 @@ func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance) {
 	}
 
 	// 5. Dynamic Skills (from workspace /skills directory)
-	a.RegisterSkills(inst)
+	a.RegisterSkills(inst, chatID)
 }
 
 // Helpers replicated from picoclaw/pkg/agent

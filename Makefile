@@ -159,19 +159,19 @@ install-deps: clean-deps
 prune-deps:
 	@echo "Pruning Python dependencies to save space..."
 	# Remove cache and compiled files
-	find $(PYTHON_ROOT) -name "__pycache__" -exec rm -rf {} +
-	find $(PYTHON_ROOT) -name "*.pyc" -delete
+	find $(PYTHON_ROOT) -name "__pycache__" -exec rm -rf {} + || true
+	find $(PYTHON_ROOT) -name "*.pyc" -delete || true
 	# Remove large unnecessary subdirectories in heavy packages
-	rm -rf $(PYTHON_TARGET)/sympy/plotting
-	rm -rf $(PYTHON_TARGET)/sympy/benchmarks
+	rm -rf $(PYTHON_TARGET)/sympy/plotting || true
+	rm -rf $(PYTHON_TARGET)/sympy/benchmarks || true
 	# Remove metadata and info (saves thousands of small files)
-	rm -rf $(PYTHON_TARGET)/*.dist-info
-	rm -rf $(PYTHON_TARGET)/*.egg-info
+	rm -rf $(PYTHON_TARGET)/*.dist-info || true
+	rm -rf $(PYTHON_TARGET)/*.egg-info || true
 	# Remove tests and docs from all packages
-	find $(PYTHON_TARGET) -type d -name "tests" -exec rm -rf {} +
-	find $(PYTHON_TARGET) -type d -name "test" -exec rm -rf {} +
-	find $(PYTHON_TARGET) -type d -name "testing" -exec rm -rf {} +
-	find $(PYTHON_TARGET) -type d -name "docs" -exec rm -rf {} +
+	find $(PYTHON_TARGET) -type d -name "tests" -exec rm -rf {} + || true
+	find $(PYTHON_TARGET) -type d -name "test" -exec rm -rf {} + || true
+	find $(PYTHON_TARGET) -type d -name "testing" -exec rm -rf {} + || true
+	find $(PYTHON_TARGET) -type d -name "docs" -exec rm -rf {} + || true
 	# Remove specialized fontTools modules not needed for basic PDF generation (saves ~10MB)
 	# varLib: variable fonts, feaLib: OpenType features, cu2qu/qu2cu: curve conversion
 	rm -rf $(PYTHON_TARGET)/fontTools/varLib
@@ -192,7 +192,7 @@ test:
 	$(GO) test -v ./...
 
 ## build-lambdas: Build all Lambdas for AWS
-build-lambdas: test download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda build-tg-heartbeat-lambda
+build-lambdas: test download-bins download-python install-deps build-tg-webhook-lambda build-tg-worker-lambda build-task-executor-lambda build-tg-heartbeat-lambda
 	@echo "All Lambdas built successfully."
 
 ## build-tg-webhook-lambda: Build the Telegram Webhook Lambda for AWS
@@ -219,6 +219,21 @@ build-tg-worker-lambda:
 	@rm -f $(BUILD_DIR)/tg-worker-lambda.zip
 	@cd $(BUILD_DIR)/tg-worker-lambda && zip -qry ../tg-worker-lambda.zip bootstrap config.json assets
 	@echo "Build complete: $(BUILD_DIR)/tg-worker-lambda.zip"
+
+## build-task-executor-lambda: Build the Python Task Executor Lambda for AWS
+build-task-executor-lambda:
+	@echo "Building task-executor-lambda for AWS..."
+	@rm -rf $(BUILD_DIR)/task-executor-lambda
+	@mkdir -p $(BUILD_DIR)/task-executor-lambda
+	@cp deployment/executor.py $(BUILD_DIR)/task-executor-lambda/handler.py
+	@mkdir -p $(BUILD_DIR)/task-executor-lambda/lib
+	@cp -r assets/python/lib/python3.12/site-packages/* $(BUILD_DIR)/task-executor-lambda/lib/
+	@cp -r internal/assets/skeleton/skills $(BUILD_DIR)/task-executor-lambda/
+	@echo "Total unzipped size of Executor Lambda: $$(du -sh $(BUILD_DIR)/task-executor-lambda | cut -f1)"
+	@echo "Building zip: $(BUILD_DIR)/task-executor-lambda.zip"
+	@rm -f $(BUILD_DIR)/task-executor-lambda.zip
+	@cd $(BUILD_DIR)/task-executor-lambda && zip -qry ../task-executor-lambda.zip handler.py lib skills
+	@echo "Build complete: $(BUILD_DIR)/task-executor-lambda.zip"
 
 ## build-tg-heartbeat-lambda: Build the Heartbeat Dispatcher Lambda for AWS
 build-tg-heartbeat-lambda:

@@ -33,20 +33,31 @@ import (
 // WorkerApp manages the lifecycle of a worker instance, handling
 // workspace preparation, agent execution, and message processing.
 type WorkerApp struct {
-	Agent       *agent.AgentLoop
-	Channel     *telegram.TelegramChannel
-	Bus         *bus.MessageBus
-	Bot         *telego.Bot
-	MediaStore  media.MediaStore
-	Transcriber *transcriber.WhisperTranscriber
-	BaseDir     string
-	BotToken    string
-	initPyPath  string
+	Agent           *agent.AgentLoop
+	Channel         *telegram.TelegramChannel
+	Bus             *bus.MessageBus
+	Bot             *telego.Bot
+	MediaStore      media.MediaStore
+	Transcriber     *transcriber.WhisperTranscriber
+	BaseDir         string
+	BotToken        string
+	initPyPath      string
+	TaskExecutorURL string
 }
 
 type HeartbeatMessage struct {
 	Type   string `json:"type"`
 	ChatID string `json:"chat_id"`
+}
+
+type TaskResultMessage struct {
+	Type     string         `json:"type"`
+	TaskID   string         `json:"task_id"`
+	ChatID   string         `json:"chat_id"`
+	Skill    string         `json:"skill"`
+	Result   string         `json:"result"`
+	IsError  bool           `json:"is_error"`
+	Metadata map[string]any `json:"metadata"`
 }
 
 func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
@@ -150,15 +161,16 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 	}
 
 	return &WorkerApp{
-		Agent:       agentLoop,
-		Channel:     tgChan,
-		Bus:         msgBus,
-		Bot:         bot,
-		MediaStore:  mediaStore,
-		Transcriber: tr,
-		BotToken:    tgSettings.Token.String(),
-		BaseDir:     baseDir,
-		initPyPath:  initPyPath,
+		Agent:           agentLoop,
+		Channel:         tgChan,
+		Bus:             msgBus,
+		Bot:             bot,
+		MediaStore:      mediaStore,
+		Transcriber:     tr,
+		BotToken:        tgSettings.Token.String(),
+		BaseDir:         baseDir,
+		initPyPath:      initPyPath,
+		TaskExecutorURL: os.Getenv("TASK_EXECUTOR_URL"),
 	}, nil
 }
 
@@ -175,81 +187,150 @@ func (a *WorkerApp) Handle(ctx context.Context, sqsEvent events.SQSEvent) error 
 }
 
 func (a *WorkerApp) processSQSRecord(ctx context.Context, record events.SQSMessage) error {
-	// 1. Try to unmarshal as HeartbeatMessage first
-	var hb HeartbeatMessage
-	if err := json.Unmarshal([]byte(record.Body), &hb); err == nil && hb.Type == "heartbeat" {
-		log.Ctx(ctx).Info().Str("chat_id", hb.ChatID).Msg("Processing internal heartbeat message")
-
-		inMsg := &bus.InboundMessage{
-			Context: bus.InboundContext{
-				Channel: "telegram",
-				ChatID:  hb.ChatID,
-			},
-			ChatID:  hb.ChatID,
-			Channel: "telegram",
-		}
-		return a.processAgentTurn(ctx, hb.ChatID, inMsg, true)
+	// 1. Heartbeat check
+	handled, err := a.tryHandleHeartbeat(ctx, record)
+	if handled {
+		return err
 	}
 
-	// 2. Fallback to Telegram Update
+	// 2. Task Result check
+	handled, err = a.tryHandleTaskResult(ctx, record)
+	if handled {
+		return err
+	}
+
+	// 3. Fallback to Telegram Update
+	return a.handleTelegramUpdate(ctx, record)
+}
+
+func (a *WorkerApp) tryHandleHeartbeat(ctx context.Context, record events.SQSMessage) (bool, error) {
+	var hb HeartbeatMessage
+	if err := json.Unmarshal([]byte(record.Body), &hb); err != nil || hb.Type != "heartbeat" {
+		return false, nil
+	}
+
+	log.Ctx(ctx).Info().Str("chat_id", hb.ChatID).Msg("Processing internal heartbeat message")
+	inMsg := &bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  hb.ChatID,
+		},
+		ChatID:  hb.ChatID,
+		Channel: "telegram",
+	}
+	return true, a.processAgentTurn(ctx, hb.ChatID, inMsg, true, nil)
+}
+
+func (a *WorkerApp) tryHandleTaskResult(ctx context.Context, record events.SQSMessage) (bool, error) {
+	var tr TaskResultMessage
+	if err := json.Unmarshal([]byte(record.Body), &tr); err != nil || tr.Type != "task_result" {
+		return false, nil
+	}
+
+	log.Ctx(ctx).Info().
+		Str("chat_id", tr.ChatID).
+		Str("task_id", tr.TaskID).
+		Str("skill", tr.Skill).
+		Msg("Processing background task result")
+
+	status := "success"
+	if tr.IsError {
+		status = "error"
+	}
+
+	inMsg := &bus.InboundMessage{
+		Context: bus.InboundContext{
+			Channel: "telegram",
+			ChatID:  tr.ChatID,
+		},
+		ChatID:  tr.ChatID,
+		Channel: "telegram",
+		Content: fmt.Sprintf("[Background Task Result]\nSkill: %s\nTask ID: %s\nChat ID: %s\nStatus: %s\nOutput: %s", tr.Skill, tr.TaskID, tr.ChatID, status, tr.Result),
+	}
+	if tr.Metadata == nil {
+		tr.Metadata = make(map[string]any)
+	}
+	tr.Metadata["_task_id"] = tr.TaskID
+	return true, a.processAgentTurn(ctx, tr.ChatID, inMsg, false, tr.Metadata)
+}
+
+func (a *WorkerApp) handleTelegramUpdate(ctx context.Context, record events.SQSMessage) error {
 	var update telego.Update
 	if err := json.Unmarshal([]byte(record.Body), &update); err != nil {
 		return fmt.Errorf("unmarshal telegram update: %w", err)
 	}
 
+	// Safety check: Skip updates that don't contain a processable message
+	if tgutil.ExtractMessage(update) == nil {
+		log.Ctx(ctx).Info().
+			Int("update_id", update.UpdateID).
+			Str("message_id", record.MessageId).
+			Str("raw_body", record.Body).
+			Msg("Skipping SQS record: no processable Telegram message found")
+		return nil
+	}
+
 	inMsg, err := tgutil.TranslateUpdate(ctx, a.Bot, update, a.MediaStore, "")
 	if err != nil {
+		log.Ctx(ctx).Warn().
+			Str("raw_body", record.Body).
+			Err(err).
+			Msg("Failed to translate update. Raw body logged.")
 		return fmt.Errorf("translate update: %w", err)
 	}
 
 	// Automatic Transcription
 	if len(inMsg.Media) > 0 {
-		var newMedia []string
-		for _, ref := range inMsg.Media {
-			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
-			if err != nil {
-				newMedia = append(newMedia, ref)
-				continue
-			}
-			
-			if strings.HasSuffix(strings.ToLower(meta.Filename), ".ogg") || strings.HasSuffix(strings.ToLower(meta.Filename), ".mp3") {
-				if a.Transcriber != nil {
-					res, err := a.Transcriber.Transcribe(ctx, path)
-					if err == nil && res.Text != "" {
-						log.Ctx(ctx).Info().Str("transcript", res.Text).Msg("Voice transcribed successfully")
-						if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
-							inMsg.Content = res.Text
-						} else {
-							inMsg.Content = fmt.Sprintf("%s\n\n[voice: %s]", inMsg.Content, res.Text)
-						}
-					} else {
-						errStr := "unknown error"
-						if err != nil {
-							errStr = err.Error()
-						}
-						log.Ctx(ctx).Warn().Str("error", errStr).Msg("Voice transcription failed")
-						if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
-							inMsg.Content = "[Unintelligible voice message]"
-						}
-					}
-				} else {
-					log.Ctx(ctx).Warn().Msg("Voice message received but Transcriber is not configured")
-				}
-				// Don't pass audio to LLM context under ANY circumstances
-				continue
-			}
-			newMedia = append(newMedia, ref)
-		}
-		inMsg.Media = newMedia
+		a.handleMediaTranscription(ctx, inMsg)
 	}
 
 	// Handle special system commands (e.g., /reset)
 	a.handleSpecialCommands(ctx, inMsg)
 
-	return a.processAgentTurn(ctx, inMsg.Context.ChatID, inMsg, false)
+	return a.processAgentTurn(ctx, inMsg.Context.ChatID, inMsg, false, nil)
 }
 
-func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *bus.InboundMessage, isHeartbeat bool) error {
+func (a *WorkerApp) handleMediaTranscription(ctx context.Context, inMsg *bus.InboundMessage) {
+	var newMedia []string
+	for _, ref := range inMsg.Media {
+		path, meta, err := a.MediaStore.ResolveWithMeta(ref)
+		if err != nil {
+			newMedia = append(newMedia, ref)
+			continue
+		}
+
+		if strings.HasSuffix(strings.ToLower(meta.Filename), ".ogg") || strings.HasSuffix(strings.ToLower(meta.Filename), ".mp3") {
+			if a.Transcriber != nil {
+				res, err := a.Transcriber.Transcribe(ctx, path)
+				if err == nil && res.Text != "" {
+					log.Ctx(ctx).Info().Str("transcript", res.Text).Msg("Voice transcribed successfully")
+					if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
+						inMsg.Content = res.Text
+					} else {
+						inMsg.Content = fmt.Sprintf("%s\n\n[voice: %s]", inMsg.Content, res.Text)
+					}
+				} else {
+					errStr := "unknown error"
+					if err != nil {
+						errStr = err.Error()
+					}
+					log.Ctx(ctx).Warn().Str("error", errStr).Msg("Voice transcription failed")
+					if inMsg.Content == "[voice]" || inMsg.Content == "[empty message]" {
+						inMsg.Content = "[Unintelligible voice message]"
+					}
+				}
+			} else {
+				log.Ctx(ctx).Warn().Msg("Voice message received but Transcriber is not configured")
+			}
+			// Don't pass audio to LLM context under ANY circumstances
+			continue
+		}
+		newMedia = append(newMedia, ref)
+	}
+	inMsg.Media = newMedia
+}
+
+func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *bus.InboundMessage, isHeartbeat bool, taskMetadata map[string]any) error {
 	logger := log.Ctx(ctx).With().Str("chat_id", chatID).Logger()
 	ctx = logger.WithContext(ctx)
 
@@ -269,6 +350,27 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	if err != nil {
 		return err
+	}
+
+	// 1.5 Restore task metadata if present (must happen AFTER prepareWorkspace)
+	if len(taskMetadata) > 0 {
+		taskID := ""
+		// Try to extract task ID from the message content or metadata itself
+		// In processSQSRecord we know it's TaskResultMessage, but here we just have the map.
+		// Actually, let's just use a special key in metadata for TaskID if possible,
+		// or rely on the fact that for TaskResult it was already in tr.TaskID.
+		// Let's modify TaskResultMessage to include TaskID in its metadata map too just in case.
+		if id, ok := taskMetadata["_task_id"].(string); ok {
+			taskID = id
+		}
+
+		if taskID != "" {
+			metaStr, _ := json.Marshal(taskMetadata)
+			jobDir := filepath.Join(chatWorkspace, "memory", "jobs")
+			_ = os.MkdirAll(jobDir, 0755)
+			_ = os.WriteFile(filepath.Join(jobDir, fmt.Sprintf("%s.json", taskID)), metaStr, 0644)
+			logger.Debug().Str("task_id", taskID).Msg("Restored task metadata to workspace")
+		}
 	}
 
 	// 2. Setup isolated Python environment inside workspace
@@ -299,7 +401,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	}
 
 	// 4. Create Isolated Agent
-	agentInst, err := a.createAgent(chatWorkspace)
+	agentInst, err := a.createAgent(chatID, chatWorkspace)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
@@ -353,7 +455,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 				attachedFiles = append(attachedFiles, destName)
 			}
 		}
-		
+
 		if len(attachedFiles) > 0 {
 			if inMsg.Content != "" {
 				inMsg.Content += "\n\n"
@@ -484,7 +586,7 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	return !restoredFromS3, nil
 }
 
-func (a *WorkerApp) createAgent(workspacePath string) (*agent.AgentInstance, error) {
+func (a *WorkerApp) createAgent(chatID string, workspacePath string) (*agent.AgentInstance, error) {
 	globalConfig := a.Agent.GetConfig()
 	defaultAgent := a.Agent.GetRegistry().GetDefaultAgent()
 	if defaultAgent == nil {
@@ -508,7 +610,7 @@ func (a *WorkerApp) createAgent(workspacePath string) (*agent.AgentInstance, err
 	requestAgentCfg.Workspace = workspacePath
 
 	inst := agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider)
-	a.EquipAgent(inst)
+	a.EquipAgent(inst, chatID)
 	return inst, nil
 }
 
@@ -551,8 +653,10 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 						}
 					case msg, ok := <-a.Bus.OutboundMediaChan():
 						if ok {
-							if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
-								logger.Error().Err(err).Msg("Failed to send media")
+							if msg.ChatID != "main" {
+								if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
+									logger.Error().Err(err).Msg("Failed to send media")
+								}
 							}
 							continue
 						}
@@ -567,8 +671,10 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 				}
 			case msg, ok := <-a.Bus.OutboundMediaChan():
 				if ok {
-					if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
-						logger.Error().Err(err).Msg("Failed to send media")
+					if msg.ChatID != "main" {
+						if _, err := a.Channel.SendMedia(ctx, msg); err != nil {
+							logger.Error().Err(err).Msg("Failed to send media")
+						}
 					}
 				}
 			}
@@ -607,8 +713,13 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		}
 	}
 
+	sessionKey := inMsg.ChatID
+	if isHeartbeat {
+		sessionKey = "system:heartbeat:" + inMsg.ChatID
+	}
+
 	_, err := driver.RunAgent(agent.WithTurnContext(processCtx, a.Agent, agentInst), agentInst, processOptions{
-		SessionKey:           inMsg.ChatID,
+		SessionKey:           sessionKey,
 		Channel:              "telegram",
 		ChatID:               inMsg.ChatID,
 		MessageID:            inMsg.Context.MessageID,
@@ -616,11 +727,12 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		Media:                inMsg.Media,
 		DefaultResponse:      "No tasks",
 		EnableSummary:        true,
-		SendResponse:         !isHeartbeat,
+		SendResponse:         !isHeartbeat && inMsg.ChatID != "main",
 		SenderID:             inMsg.SenderID,
 		SenderDisplayName:    inMsg.Sender.DisplayName,
 		SuppressToolFeedback: strings.ToLower(os.Getenv("PICOCLAW_SUPPRESS_TOOLS")) != "false",
 		SuppressReasoning:    strings.ToLower(os.Getenv("PICOCLAW_SUPPRESS_REASONING")) != "false",
+		DisableHistory:       isHeartbeat,
 	})
 
 	// Wait for a small grace period to allow any last-second async messages to enter the bus

@@ -1,12 +1,19 @@
 package worker
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/google/shlex"
 
 	"github.com/rs/zerolog/log"
 	"github.com/sipeed/picoclaw/pkg/agent"
@@ -15,11 +22,14 @@ import (
 
 // SkillTool is a dynamic tool that executes a script in a skill directory.
 type SkillTool struct {
-	name         string
-	description  string
-	skillDir     string
-	engineScript string
-	workspace    string
+	name           string
+	description    string
+	skillDir       string
+	engineScript   string
+	workspace      string
+	chatID         string
+	executorURL    string
+	autoBackground []string
 }
 
 func (t *SkillTool) Name() string {
@@ -47,6 +57,14 @@ func (t *SkillTool) Parameters() map[string]any {
 				"type":        "string",
 				"description": "The subcommand and its arguments to run (e.g., 'submit --prompt \"cat\"'). See instructions below.",
 			},
+			"background": map[string]any{
+				"type":        "boolean",
+				"description": "If true, the task will run in the background. DEFAULT IS TRUE FOR 'submit' COMMANDS. Use this for long-running tasks like image generation. I will notify you when it's finished.",
+			},
+			"chat_id": map[string]any{
+				"type":        "string",
+				"description": "Optional: Override the target chat ID for notifications. Use this if you are performing a task for a specific user while in a different context (like heartbeat).",
+			},
 		},
 		"required": []string{"command"},
 	}
@@ -65,8 +83,31 @@ func (t *SkillTool) Execute(ctx context.Context, args map[string]any) *tools.Too
 		return &tools.ToolResult{ForLLM: "missing 'command' argument for active skill", IsError: true}
 	}
 
-	// Split the command string into parts, respecting quotes
-	parts := splitArgs(cmdStr)
+	background, _ := args["background"].(bool)
+	// Safety net: auto-force background for specific subcommands if executor is available
+	if t.executorURL != "" && !background {
+		fields := strings.Fields(cmdStr)
+		if len(fields) > 0 {
+			subCmd := fields[0]
+			for _, auto := range t.autoBackground {
+				if subCmd == auto {
+					background = true
+					break
+				}
+			}
+		}
+	}
+
+	if background && t.executorURL != "" {
+		chatID, _ := args["chat_id"].(string)
+		return t.executeBackground(ctx, cmdStr, chatID)
+	}
+
+	// Split the command string into parts, respecting quotes using shlex
+	parts, err := shlex.Split(cmdStr)
+	if err != nil {
+		return &tools.ToolResult{ForLLM: "failed to parse command: " + err.Error(), IsError: true}
+	}
 	if len(parts) == 0 {
 		return &tools.ToolResult{ForLLM: "empty command", IsError: true}
 	}
@@ -75,7 +116,7 @@ func (t *SkillTool) Execute(ctx context.Context, args map[string]any) *tools.Too
 	fullArgs := append([]string{t.engineScript}, parts...)
 	cmd := exec.CommandContext(ctx, "python3", fullArgs...)
 	cmd.Dir = t.workspace
-	
+
 	// Ensure we pass the same environment (PATH, etc.)
 	cmd.Env = os.Environ()
 
@@ -98,34 +139,54 @@ func (t *SkillTool) Execute(ctx context.Context, args map[string]any) *tools.Too
 	}
 }
 
-// splitArgs performs simple shell-style argument splitting, respecting double quotes.
-func splitArgs(s string) []string {
-	var parts []string
-	var current strings.Builder
-	inQuotes := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '"' {
-			inQuotes = !inQuotes
-			continue
-		}
-		if c == ' ' && !inQuotes {
-			if current.Len() > 0 {
-				parts = append(parts, current.String())
-				current.Reset()
-			}
-			continue
-		}
-		current.WriteByte(c)
+func (t *SkillTool) executeBackground(ctx context.Context, command string, chatIDOverride string) *tools.ToolResult {
+	targetChatID := t.chatID
+	if chatIDOverride != "" {
+		targetChatID = chatIDOverride
 	}
-	if current.Len() > 0 {
-		parts = append(parts, current.String())
+
+	payload := map[string]any{
+		"skill":   t.name,
+		"engine":  t.engineScript,
+		"command": command,
+		"chat_id": targetChatID,
 	}
-	return parts
+	data, _ := json.Marshal(payload)
+
+	// Fire and forget (almost)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", t.executorURL, bytes.NewBuffer(data))
+	if err != nil {
+		return &tools.ToolResult{ForLLM: "failed to create background request: " + err.Error(), IsError: true}
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return &tools.ToolResult{
+			ForLLM: "failed to trigger background task: " + err.Error(), IsError: true,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		result, _ := io.ReadAll(resp.Body)
+		return &tools.ToolResult{
+			ForLLM: fmt.Sprintf("executor returned error status: %d: %s", resp.StatusCode, string(result)), IsError: true,
+		}
+	}
+
+	result, _ := io.ReadAll(resp.Body)
+	return &tools.ToolResult{
+		ForLLM: fmt.Sprintf("Task submitted to background. Executor response: %s\n[SYSTEM: Task is now running in the background. I will notify you in this chat when it's done. FINISH YOUR TURN NOW and do not call 'status' or 'check' immediately.]", string(result)),
+	}
 }
 
+
 // RegisterSkills scans the workspace for skills and registers them as tools.
-func (a *WorkerApp) RegisterSkills(inst *agent.AgentInstance) {
+func (a *WorkerApp) RegisterSkills(inst *agent.AgentInstance, chatID string) {
 	skillsDir := filepath.Join(inst.Workspace, "skills")
 	entries, err := os.ReadDir(skillsDir)
 	if err != nil {
@@ -160,24 +221,36 @@ func (a *WorkerApp) RegisterSkills(inst *agent.AgentInstance) {
 		engineScript := ""
 		files, _ := os.ReadDir(skillPath)
 		for _, f := range files {
-			if strings.HasSuffix(f.Name(), "_engine.py") {
+			if strings.HasSuffix(f.Name(), ".py") {
+				// Prefer *_engine.py or engine.py, but accept any .py as fallback
 				engineScript = filepath.Join("skills", skillName, f.Name())
-				break
+				if strings.HasSuffix(f.Name(), "_engine.py") || f.Name() == "engine.py" {
+					break
+				}
 			}
 		}
 
-		inst.Tools.Register(&SkillTool{
+		tool := &SkillTool{
 			name:         name,
 			description:  desc,
 			skillDir:     skillPath,
 			engineScript: engineScript,
 			workspace:    inst.Workspace,
-		})
-		
+			chatID:       chatID,
+			executorURL:  a.TaskExecutorURL,
+		}
+
+		// Configure auto-background for specific skills
+		if name == "draw" {
+			tool.autoBackground = []string{"submit"}
+		}
+
+		inst.Tools.Register(tool)
+
 		if engineScript != "" {
-			log.Info().Str("skill", name).Msg("Registered active skill tool")
+			log.Debug().Str("skill", name).Msg("Registered active skill tool")
 		} else {
-			log.Info().Str("skill", name).Msg("Registered informational skill tool")
+			log.Debug().Str("skill", name).Msg("Registered informational skill tool")
 		}
 	}
 }

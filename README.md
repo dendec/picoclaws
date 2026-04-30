@@ -60,6 +60,22 @@ Deploy to AWS using the Serverless framework:
 make deploy
 ```
 
+## ⚡ Background Task System (Executor & Waiter)
+
+PicoClAWS features a robust system for handling long-running tasks (like image generation) without blocking the primary agent loop or hitting Lambda timeouts.
+
+### How it Works:
+1.  **Submission**: An agent calls a skill tool (e.g., `draw`). If the task is long-running, the worker sends an HTTP request to the **Executor Lambda**.
+2.  **Monitoring**: The Executor starts the task and, if it receives a `task_id`, queues a message in the **Task SQS Queue**.
+3.  **Polling**: The **Waiter Lambda** is triggered by the queue. It periodically calls the skill's `check` command.
+4.  **Completion**: Once the task is finished, the Waiter sends the result to the **Updates SQS Queue**, which triggers the **Worker** to notify the user.
+
+### 📜 Skill Contract:
+For a skill to support background execution, its Python engine must implement:
+- **`submit` command**: Returns a JSON containing an `id` field.
+- **`check --id <ID>` command**: Returns a JSON with `{"done": true}` or `{"faulted": true}`.
+- **Statelessness**: The Executor runs in a temporary directory. Any state needed for the final result (like original promp metadata) should be returned in the `submit` response as `_metadata`, which PicoClAWS will automatically persist and restore in the user's workspace.
+
 ## 🏗 Project Structure
 
 - `cmd/`: Entry points for Webhook and Worker Lambdas.

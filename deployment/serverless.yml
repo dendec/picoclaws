@@ -25,7 +25,10 @@ provider:
             - sqs:ReceiveMessage
             - sqs:DeleteMessage
             - sqs:GetQueueAttributes
-          Resource: !GetAtt UpdatesQueue.Arn
+          Resource: 
+            - !GetAtt UpdatesQueue.Arn
+            - !GetAtt TaskQueue.Arn
+            - !GetAtt TaskDLQ.Arn
         - Effect: Allow
           Action:
             - s3:PutObject
@@ -59,6 +62,7 @@ functions:
       PYTHONPATH: /var/task/assets/python/lib/python3.12/site-packages
       LD_LIBRARY_PATH: /var/task/assets/python/lib
       API_KEY: ${env:API_KEY}
+      TASK_EXECUTOR_URL: !GetAtt ExecutorLambdaFunctionUrl.FunctionUrl
     events:
       - sqs:
           arn: !GetAtt UpdatesQueue.Arn
@@ -78,6 +82,37 @@ functions:
           rate: rate(1 hour)
           enabled: true
 
+  executor:
+    handler: handler.http_handler
+    runtime: python3.12
+    timeout: 30 # Quick submission
+    memorySize: 512
+    url: true
+    environment:
+      QUEUE_URL: !Ref TaskQueue
+      PICOCLAW_WORKSPACE_BUCKET: !Ref WorkspacesBucket
+      PYTHONPATH: /var/task/lib
+      API_KEY: ${env:API_KEY}
+    package:
+      artifact: ../build/task-executor-lambda.zip
+
+  waiter:
+    handler: handler.sqs_handler
+    runtime: python3.12
+    timeout: 20 # Quick check only
+    memorySize: 512
+    environment:
+      RESULT_QUEUE_URL: !Ref UpdatesQueue
+      PICOCLAW_WORKSPACE_BUCKET: !Ref WorkspacesBucket
+      PYTHONPATH: /var/task/lib
+      API_KEY: ${env:API_KEY}
+    package:
+      artifact: ../build/task-executor-lambda.zip
+    events:
+      - sqs:
+          arn: !GetAtt TaskQueue.Arn
+          batchSize: 1
+
 resources:
   Resources:
     # --- Storage (S3) ---
@@ -94,3 +129,20 @@ resources:
         FifoQueue: true
         ContentBasedDeduplication: true
         VisibilityTimeout: 330 # Must be > Lambda timeout (300s) + buffer
+
+    TaskQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: picoclaw-tasks-queue.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 10 # Retry every 10 seconds
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt TaskDLQ.Arn
+          maxReceiveCount: 90 # ~15 minutes total polling
+
+    TaskDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: picoclaw-tasks-dlq.fifo
+        FifoQueue: true
