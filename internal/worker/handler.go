@@ -368,6 +368,9 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 
 	// 2. Setup Context and Environment
 	a.restoreTaskMetadata(ctx, chatWorkspace, taskMetadata)
+	if err := assets.RestoreSkills(chatWorkspace); err != nil {
+		log.Ctx(ctx).Error().Err(err).Msg("Failed to restore skills to workspace")
+	}
 	a.configureEnvironment(chatWorkspace)
 
 	if isHeartbeat {
@@ -488,7 +491,6 @@ func (a *WorkerApp) materializeMedia(ctx context.Context, chatWorkspace string, 
 		}
 	}
 }
-
 
 func (a *WorkerApp) buildHeartbeatPrompt() string {
 	now := time.Now().Format("2006-01-02 15:04:05")

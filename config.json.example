@@ -8,9 +8,8 @@
   },
   "agents": {
     "defaults": {
-      "workspace": "/tmp/agent/main",
-      "restrict_to_workspace": true,
-      "allow_read_outside_workspace": false,
+      "restrict_to_workspace": false,
+      "allow_read_outside_workspace": true,
       "model_name": "gemini-2.0-flash",
       "max_tokens": 8192,
       "temperature": 0.7,
