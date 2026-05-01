@@ -345,21 +345,45 @@ func (a *WorkerApp) handleMediaTranscription(ctx context.Context, inMsg *bus.Inb
 }
 
 func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *bus.InboundMessage, isHeartbeat bool, taskMetadata map[string]any) error {
-	logger := log.Ctx(ctx).With().Str("chat_id", chatID).Logger()
-	ctx = logger.WithContext(ctx)
+	chatWorkspace := a.getWorkspacePath(chatID)
+	
+	triggerType := "message"
+	if isHeartbeat {
+		triggerType = "heartbeat"
+	} else if taskID, ok := taskMetadata["_task_id"].(string); ok && taskID != "" {
+		triggerType = "task_result"
+	}
 
+	logger := log.Ctx(ctx).With().
+		Str("chat_id", chatID).
+		Str("workspace", chatWorkspace).
+		Logger()
+	ctx = logger.WithContext(ctx)
+ 
 	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
 	var s3Storage *aws.S3Storage
 	if bucket != "" {
 		var err error
 		s3Storage, err = aws.NewS3Storage(ctx, bucket)
 		if err != nil {
-			log.Ctx(ctx).Error().Err(err).Msg("Failed to initialize S3 storage")
+			logger.Error().Err(err).Msg("Failed to initialize S3 storage")
 		}
 	}
-
-	chatWorkspace := a.getWorkspacePath(chatID)
-
+ 
+	startLog := logger.Info().
+		Str("trigger", triggerType).
+		Str("sender", inMsg.SenderID).
+		Str("content", inMsg.Content).
+		Int("media_count", len(inMsg.Media))
+	
+	if triggerType == "task_result" {
+		if taskID, ok := taskMetadata["_task_id"].(string); ok {
+			startLog = startLog.Str("task_id", taskID)
+		}
+	}
+	
+	startLog.Msg("Starting agent turn processing")
+ 
 	// 1. Prepare Workspace (Download from S3)
 	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	if err != nil {
@@ -371,6 +395,13 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	if err := assets.RestoreSkills(chatWorkspace); err != nil {
 		log.Ctx(ctx).Error().Err(err).Msg("Failed to restore skills to workspace")
 	}
+
+	if err := os.Chdir(chatWorkspace); err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("path", chatWorkspace).Msg("Failed to change directory to workspace")
+	} else {
+		log.Ctx(ctx).Debug().Msg("Changed working directory to workspace")
+	}
+
 	a.configureEnvironment(chatWorkspace)
 
 	if isHeartbeat {
@@ -562,7 +593,9 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	if _, err := os.Stat(chatWorkspace); err == nil && s3Meta != nil {
 		if verData, err := os.ReadFile(localVersionFile); err == nil {
 			if string(verData) == s3Meta.ETag {
-				logger.Info().Str("chat_id", chatID).Msg("Reusing warm workspace from /tmp; skipping S3 download")
+				logger.Info().
+					Str("path", chatWorkspace).
+					Msg("Reusing warm workspace; skipping S3 download")
 				useWarmWorkspace = true
 			}
 		}
@@ -570,6 +603,9 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 
 	restoredFromS3 := useWarmWorkspace
 	if !useWarmWorkspace && s3Storage != nil {
+		logger.Info().
+			Str("key", s3Key).
+			Msg("Downloading workspace from S3")
 		data, err := s3Storage.Download(ctx, s3Key)
 		if err == nil && data != nil {
 			if err := archive.Unarchive(data, chatWorkspace); err == nil {
@@ -582,7 +618,9 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	}
 
 	if !restoredFromS3 {
-		logger.Info().Str("chat_id", chatID).Msg("No S3 archive found, wiping local workspace for clean start")
+		logger.Info().
+			Str("path", chatWorkspace).
+			Msg("No S3 archive found, initializing fresh workspace from assets")
 		_ = os.RemoveAll(chatWorkspace) // Ensure clean state
 		if err := os.MkdirAll(chatWorkspace, 0755); err != nil {
 			return false, fmt.Errorf("failed to create directory: %w", err)
