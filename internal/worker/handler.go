@@ -16,12 +16,12 @@ import (
 	"picoclaws/internal/assets"
 	"picoclaws/internal/platform/aws"
 	"picoclaws/internal/platform/telegram/tgutil"
-	"picoclaws/internal/transcriber"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/mymmrac/telego"
 	"github.com/rs/zerolog/log"
 	"github.com/sipeed/picoclaw/pkg/agent"
+	"github.com/sipeed/picoclaw/pkg/audio/asr"
 	"github.com/sipeed/picoclaw/pkg/bus"
 	"github.com/sipeed/picoclaw/pkg/channels/telegram"
 	"github.com/sipeed/picoclaw/pkg/config"
@@ -38,7 +38,7 @@ type WorkerApp struct {
 	Bus             *bus.MessageBus
 	Bot             *telego.Bot
 	MediaStore      media.MediaStore
-	Transcriber     *transcriber.WhisperTranscriber
+	Transcriber     *asr.WhisperTranscriber
 	BaseDir         string
 	BotToken        string
 	initPyPath      string
@@ -155,9 +155,14 @@ func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
 	agentLoop := agent.NewAgentLoop(cfg, msgBus, provider)
 	agentLoop.SetMediaStore(mediaStore)
 
-	tr, err := transcriber.NewTranscriber(cfg, mediaStore)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to initialize transcriber (voice messages will not be transcribed)")
+	var tr *asr.WhisperTranscriber
+	if cfg.Voice.ModelName != "" {
+		voiceModel, err := cfg.GetModelConfig(cfg.Voice.ModelName)
+		if err != nil {
+			log.Ctx(ctx).Warn().Err(err).Str("model", cfg.Voice.ModelName).Msg("Voice model not found, transcription disabled")
+		} else {
+			tr = asr.NewWhisperTranscriber(voiceModel)
+		}
 	}
 
 	return &WorkerApp{

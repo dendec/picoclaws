@@ -8,7 +8,7 @@ import (
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"picoclaws/internal/app/webhook"
+	"picoclaws/internal/webhook"
 )
 
 func main() {
