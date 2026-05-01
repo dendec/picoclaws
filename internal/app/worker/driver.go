@@ -30,7 +30,6 @@ type processOptions struct {
 	MessageID            string
 	UserMessage          string
 	Media                []string
-	DefaultResponse      string
 	EnableSummary        bool
 	SendResponse         bool
 	SenderID             string
@@ -98,12 +97,8 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 		return "", err
 	}
 
-	if finalContent == "" {
-		finalContent = opts.DefaultResponse
-	}
-
 	// 4. Save final assistant message to session
-	if !opts.DisableHistory {
+	if !opts.DisableHistory && finalContent != "" {
 		inst.Sessions.AddMessage(opts.SessionKey, "assistant", finalContent)
 		inst.Sessions.Save(opts.SessionKey)
 	}
@@ -117,7 +112,7 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 			break
 		}
 	}
-	if !suppress && len(sentMessages) > 0 && (finalContent == "" || finalContent == opts.DefaultResponse) {
+	if !suppress && len(sentMessages) > 0 && finalContent == "" {
 		suppress = true
 	}
 

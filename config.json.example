@@ -1,30 +1,85 @@
 {
+  "version": 3,
+  "session": {
+    "dimensions": ["channel", "peer"]
+  },
+  "voice": {
+    "model_name": "whisper-large"
+  },
   "agents": {
     "defaults": {
+      "workspace": "/tmp/agent/main",
+      "restrict_to_workspace": true,
+      "allow_read_outside_workspace": false,
       "model_name": "gemini-2.0-flash",
-      "workspace": "/tmp/home/workspace"
+      "max_tokens": 8192,
+      "temperature": 0.7,
+      "max_tool_iterations": 10,
+      "identity_template": "# Platform Identity\n\nYou are a helpful AI assistant."
+    },
+    "list": [
+      {
+        "id": "main",
+        "name": "Assistant",
+        "model": "gemini-2.0-flash",
+        "default": true
+      }
+    ]
+  },
+  "channel_list": {
+    "telegram": {
+      "type": "telegram",
+      "enabled": true,
+      "settings": {
+        "token": "YOUR_TELEGRAM_BOT_TOKEN_HERE"
+      }
     }
   },
   "model_list": [
     {
       "model_name": "gemini-2.0-flash",
-      "model": "gemini/gemini-2.0-flash-exp",
-      "api_key": "YOUR_GOOGLE_AI_API_KEY_HERE"
+      "model": "google/gemini-2.0-flash-exp",
+      "api_keys": [
+        "YOUR_GOOGLE_AI_API_KEY_HERE"
+      ],
+      "enabled": true
+    },
+    {
+      "model_name": "whisper-large",
+      "model": "openai/whisper-large-v3",
+      "api_keys": [
+        "YOUR_OPENAI_API_KEY_HERE"
+      ],
+      "enabled": true
     }
   ],
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "token": "YOUR_TELEGRAM_BOT_TOKEN_HERE"
-    }
-  },
   "tools": {
     "allow_read_paths": [],
     "web": {
-      "enabled": true
+      "enabled": true,
+      "duckduckgo": {
+        "enabled": true,
+        "max_results": 5
+      }
     },
     "exec": {
+      "enabled": true
+    },
+    "web_fetch": {
+      "enabled": true
+    },
+    "message": {
+      "enabled": true
+    },
+    "send_file": {
+      "enabled": true
+    },
+    "subagent": {
+      "enabled": true
+    },
+    "spawn": {
       "enabled": true
     }
   }
 }
+

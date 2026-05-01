@@ -55,6 +55,7 @@ func (s *S3Storage) Download(ctx context.Context, key string) ([]byte, error) {
 
 // S3Metadata contains basic info about an S3 object.
 type S3Metadata struct {
+	Key          string
 	ETag         string
 	LastModified int64
 }
@@ -78,6 +79,7 @@ func (s *S3Storage) GetMetadata(ctx context.Context, key string) (*S3Metadata, e
 	}
 
 	return &S3Metadata{
+		Key:          key,
 		ETag:         aws.ToString(output.ETag),
 		LastModified: lm,
 	}, nil
@@ -108,9 +110,9 @@ func (s *S3Storage) Delete(ctx context.Context, key string) error {
 	return nil
 }
 
-// ListKeys returns all object keys starting with the given prefix.
-func (s *S3Storage) ListKeys(ctx context.Context, prefix string) ([]string, error) {
-	var keys []string
+// ListObjects returns all object metadata starting with the given prefix.
+func (s *S3Storage) ListObjects(ctx context.Context, prefix string) ([]S3Metadata, error) {
+	var metadata []S3Metadata
 	var continuationToken *string
 
 	for {
@@ -124,7 +126,15 @@ func (s *S3Storage) ListKeys(ctx context.Context, prefix string) ([]string, erro
 		}
 
 		for _, obj := range output.Contents {
-			keys = append(keys, aws.ToString(obj.Key))
+			lm := int64(0)
+			if obj.LastModified != nil {
+				lm = obj.LastModified.Unix()
+			}
+			metadata = append(metadata, S3Metadata{
+				Key:          aws.ToString(obj.Key),
+				ETag:         aws.ToString(obj.ETag),
+				LastModified: lm,
+			})
 		}
 
 		if !aws.ToBool(output.IsTruncated) {
@@ -133,7 +143,7 @@ func (s *S3Storage) ListKeys(ctx context.Context, prefix string) ([]string, erro
 		continuationToken = output.NextContinuationToken
 	}
 
-	return keys, nil
+	return metadata, nil
 }
 
 // IsNoSuchKey checks if an error is an AWS S3 NoSuchKey or NotFound error.

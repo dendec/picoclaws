@@ -714,9 +714,9 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 	}
 
 	sessionKey := inMsg.ChatID
-	if isHeartbeat {
-		sessionKey = "system:heartbeat:" + inMsg.ChatID
-	}
+	// Heartbeat uses the user's session key to see recent context,
+	// but we set DisableHistory to true so the heartbeat turn itself
+	// isn't recorded and doesn't pollute the chat history.
 
 	_, err := driver.RunAgent(processCtx, agentInst, processOptions{
 		SessionKey:           sessionKey,
@@ -725,7 +725,6 @@ func (a *WorkerApp) executeTurn(ctx context.Context, agentInst *agent.AgentInsta
 		MessageID:            inMsg.Context.MessageID,
 		UserMessage:          userMessage,
 		Media:                inMsg.Media,
-		DefaultResponse:      "No tasks",
 		EnableSummary:        true,
 		SendResponse:         !isHeartbeat && inMsg.ChatID != "main",
 		SenderID:             inMsg.SenderID,

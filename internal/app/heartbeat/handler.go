@@ -8,9 +8,16 @@ import (
 	"path/filepath"
 	"strings"
 
+	"time"
+
 	"picoclaws/internal/platform/aws"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/rs/zerolog/log"
+)
+
+const (
+	// InactivityThreshold defines how long a workspace can remain untouched before we skip heartbeats.
+	InactivityThreshold = 2 * time.Hour
 )
 
 type HeartbeatApp struct {
@@ -54,18 +61,28 @@ func (a *HeartbeatApp) Handle(ctx context.Context, event events.CloudWatchEvent)
 	logger := log.Ctx(ctx).With().Str("component", "heartbeat-dispatcher").Logger()
 
 	// 1. Discover all active workspaces
-	keys, err := a.S3.ListKeys(ctx, "workspaces/")
+	metadata, err := a.S3.ListObjects(ctx, "workspaces/")
 	if err != nil {
 		return fmt.Errorf("failed to list workspaces: %w", err)
 	}
 
-	logger.Info().Int("count", len(keys)).Msg("Discovered workspaces for heartbeat fan-out")
+	logger.Info().Int("total", len(metadata)).Msg("Discovered workspaces for heartbeat analysis")
 
-	for _, key := range keys {
+	skipped := 0
+	sent := 0
+	for _, meta := range metadata {
 		// Key format: workspaces/<chatID>.tar.zst
-		base := filepath.Base(key)
+		base := filepath.Base(meta.Key)
 		chatID := strings.TrimSuffix(base, ".tar.zst")
 		if chatID == "" || chatID == "." {
+			continue
+		}
+
+		// Optimization: skip workspaces that haven't been modified for a while.
+		// If a workspace is old, it means there are no new messages and previous heartbeats
+		// didn't find anything to update (otherwise they would have re-uploaded the workspace).
+		if time.Since(time.Unix(meta.LastModified, 0)) > InactivityThreshold {
+			skipped++
 			continue
 		}
 
@@ -76,9 +93,12 @@ func (a *HeartbeatApp) Handle(ctx context.Context, event events.CloudWatchEvent)
 		if err := a.SQS.SendMessage(ctx, string(body), chatID); err != nil {
 			logger.Warn().Str("chat_id", chatID).Err(err).Msg("Failed to fan-out heartbeat")
 		} else {
+			sent++
 			logger.Debug().Str("chat_id", chatID).Msg("Heartbeat task sent to SQS")
 		}
 	}
+
+	logger.Info().Int("sent", sent).Int("skipped", skipped).Msg("Heartbeat fan-out complete")
 
 	return nil
 }
