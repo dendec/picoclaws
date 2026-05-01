@@ -16,7 +16,9 @@ PYTHON_URL=https://github.com/astral-sh/python-build-standalone/releases/downloa
 all: build-lambdas
 
 ## download-bins: Download essential ARM64 static binaries
-download-bins:
+download-bins: $(BIN_TARGET)/.downloaded
+
+$(BIN_TARGET)/.downloaded:
 	@echo "Checking for essential ARM64 binaries in $(BIN_TARGET)..."
 	@mkdir -p $(BIN_TARGET)
 	@if [ ! -f $(BIN_TARGET)/busybox ] || [ $$(stat -c%s $(BIN_TARGET)/busybox) -lt 1000000 ]; then \
@@ -131,9 +133,12 @@ download-bins:
 		chmod +x $(BIN_TARGET)/sqlite3 && \
 		upx --best $(BIN_TARGET)/sqlite3; \
 	fi
+	@touch $(BIN_TARGET)/.downloaded
 
 ## download-python: Download portable Aarch64 Python 3.12
-download-python:
+download-python: $(PYTHON_ROOT)/.python_installed
+
+$(PYTHON_ROOT)/.python_installed:
 	@echo "Checking for portable Python in $(PYTHON_ROOT)..."
 	@if [ ! -f $(PYTHON_ROOT)/bin/python3 ]; then \
 		echo "Downloading portable Python 3.12 (Aarch64)..."; \
@@ -143,10 +148,13 @@ download-python:
 		rm $(PYTHON_ROOT)/python.tar.gz; \
 		echo "Python 3.12 installed in $(PYTHON_ROOT)."; \
 	fi
+	@touch $(PYTHON_ROOT)/.python_installed
 
 ## install-deps: Install Python dependencies for ARM64 Lambda
-install-deps: clean-deps
-	@echo "Installing Python dependencies to $(PYTHON_TARGET)..."
+install-deps: $(PYTHON_TARGET)/.deps_installed
+
+$(PYTHON_TARGET)/.deps_installed: requirements.txt
+	@echo "Installing/Updating Python dependencies to $(PYTHON_TARGET)..."
 	@mkdir -p $(PYTHON_TARGET)
 	pip install -r requirements.txt \
 		--platform manylinux2014_aarch64 \
@@ -154,6 +162,7 @@ install-deps: clean-deps
 		--target $(PYTHON_TARGET) \
 		--upgrade
 	@$(MAKE) prune-deps
+	@touch $(PYTHON_TARGET)/.deps_installed
 
 ## prune-deps: Remove heavy/unnecessary Python files to save space
 prune-deps:
@@ -184,6 +193,7 @@ prune-deps:
 clean-deps:
 	@echo "Cleaning Python dependencies..."
 	@rm -rf $(PYTHON_TARGET)
+	@rm -f $(PYTHON_TARGET)/.deps_installed
 	@mkdir -p $(PYTHON_TARGET)
 
 ## test: Run all Go tests
@@ -244,11 +254,19 @@ build-tg-heartbeat-lambda:
 	@cd $(BUILD_DIR)/tg-heartbeat-lambda && zip -qry ../tg-heartbeat-lambda.zip bootstrap
 	@echo "Build complete: $(BUILD_DIR)/tg-heartbeat-lambda.zip"
 
-## clean: Remove build artifacts
+## clean: Remove build artifacts and markers
 clean:
-	@echo "Cleaning build artifacts..."
+	@echo "Cleaning build artifacts and markers..."
 	@rm -rf $(BUILD_DIR)
+	@rm -f $(BIN_TARGET)/.downloaded $(PYTHON_ROOT)/.python_installed $(PYTHON_TARGET)/.deps_installed
 	@echo "Clean complete"
+
+## distclean: Remove everything including downloaded binaries and python
+distclean: clean
+	@echo "Performing deep clean of all assets..."
+	@rm -rf $(BIN_TARGET)
+	@rm -rf $(PYTHON_ROOT)
+	@echo "Distclean complete"
 
 ## deploy: Deploy Lambdas to AWS using Serverless
 deploy: build-lambdas
@@ -264,7 +282,8 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  test                Run all Go tests"
-	@echo "  build-lambdas       Build and zip all lambdas"
+	@echo "  build-lambdas       Build and zip all lambdas (optimized with markers)"
 	@echo "  deploy              Build and deploy to AWS"
-	@echo "  clean               Remove build artifacts"
+	@echo "  clean               Remove build artifacts and reset markers"
+	@echo "  distclean           Remove all assets, binaries and python (total reset)"
 	@echo "  help                Show this help"

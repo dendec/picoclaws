@@ -50,6 +50,7 @@ type Driver struct {
 const MaxVisibleHistory = 10
 
 func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts processOptions) (string, error) {
+	startTime := time.Now()
 	// 1. Build messages
 	history := inst.Sessions.GetHistory(opts.SessionKey)
 	// Soft-limit history for the LLM prompt
@@ -79,14 +80,7 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 	maxMediaSize := d.Config.Agents.Defaults.GetMaxMediaSize()
 	messages = d.resolveMediaRefs(messages, int64(maxMediaSize))
 
-	// 2. Log and save user message
-	log.Ctx(ctx).Info().
-		Str("chat_id", opts.ChatID).
-		Str("sender_id", opts.SenderID).
-		Str("sender_name", opts.SenderDisplayName).
-		Str("message", opts.UserMessage).
-		Int("media_count", len(opts.Media)).
-		Msg("User message received")
+	// 2. Save user message to history
 	if !opts.DisableHistory {
 		inst.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 	}
@@ -145,11 +139,11 @@ func (d *Driver) RunAgent(ctx context.Context, inst *agent.AgentInstance, opts p
 
 	log.Ctx(ctx).Info().
 		Str("agent_id", inst.ID).
-		Str("chat_id", opts.ChatID).
 		Str("session_key", opts.SessionKey).
 		Int("iterations", iteration).
 		Interface("usage", totalUsage).
 		Str("response", finalContent).
+		Int64("duration_ms", time.Since(startTime).Milliseconds()).
 		Msg("Agent processing complete")
 
 	return finalContent, nil
@@ -250,13 +244,12 @@ func (d *Driver) trackUsage(ctx context.Context, usage *providers.UsageInfo, tot
 	total[model] = u
 
 	log.Ctx(ctx).Info().
-		Str("chat_id", chatID).
 		Str("model", model).
 		Int("iteration", iter).
 		Int("prompt_tokens", usage.PromptTokens).
 		Int("completion_tokens", usage.CompletionTokens).
 		Int("total_tokens", usage.TotalTokens).
-		Msg("Iteration usage")
+		Msg("LLM response received")
 }
 
 func (d *Driver) handleReasoning(ctx context.Context, reasoning string, opts processOptions) {
