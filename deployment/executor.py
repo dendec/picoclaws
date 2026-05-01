@@ -1,10 +1,14 @@
 import json
 import os
-import subprocess
 import boto3
 import logging
 import shlex
 import time
+import sys
+import io
+import importlib.util
+import tempfile
+from contextlib import redirect_stdout, redirect_stderr
 
 # Configure structured JSON logging
 class JsonFormatter(logging.Formatter):
@@ -35,6 +39,58 @@ logger.setLevel(logging.INFO)
 sqs = boto3.client('sqs')
 QUEUE_URL = os.environ.get('QUEUE_URL')
 RESULT_QUEUE_URL = os.environ.get('RESULT_QUEUE_URL')
+TASK_ROOT = os.environ.get('LAMBDA_TASK_ROOT', '/var/task')
+
+# Ensure libraries and skills are in sys.path
+if TASK_ROOT not in sys.path:
+    sys.path.insert(0, TASK_ROOT)
+if f"{TASK_ROOT}/lib" not in sys.path:
+    sys.path.insert(0, f"{TASK_ROOT}/lib")
+
+def run_engine(engine_rel_path, args, extra_logs):
+    """
+    Executes a skill engine script in-process.
+    engine_rel_path: path relative to TASK_ROOT (e.g. 'skills/draw/draw_engine.py')
+    args: list of command line arguments
+    extra_logs: dict with logging context (task_id, etc.)
+    """
+    engine_abs_path = os.path.join(TASK_ROOT, engine_rel_path)
+    if not os.path.exists(engine_abs_path):
+        return None, f"Engine script not found: {engine_rel_path}"
+
+    module_name = os.path.basename(engine_rel_path).replace(".py", "")
+    
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        orig_argv = sys.argv
+        sys.argv = [engine_abs_path] + args
+        
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        
+        try:
+            # Dynamic load/cache module
+            spec = importlib.util.spec_from_file_location(module_name, engine_abs_path)
+            if module_name in sys.modules:
+                module = sys.modules[module_name]
+            else:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                try:
+                    if hasattr(module, 'main'):
+                        module.main()
+                except SystemExit as e:
+                    if (e.code or 0) != 0:
+                        return None, f"Exited with code {e.code}: {stderr.getvalue()}"
+
+            return stdout.getvalue(), stderr.getvalue()
+        except Exception as e:
+            logger.error(f"In-process execution failed: {e}", extra=extra_logs, exc_info=True)
+            return None, str(e)
+        finally:
+            sys.argv = orig_argv
 
 def http_handler(event, context):
     """Triggered by Function URL for immediate task submission."""
@@ -52,65 +108,49 @@ def http_handler(event, context):
         extra["chat_id"] = chat_id
         
         if not all([skill, engine, command, chat_id]):
-            logger.error("Missing mandatory fields in request", extra=extra)
             return {'statusCode': 400, 'body': json.dumps({'error': 'Missing fields'})}
 
         logger.info(f"Received submission for skill '{skill}' ({engine}): {command}", extra=extra)
 
-        # 1. Prepare environment
-        task_root = os.environ.get('LAMBDA_TASK_ROOT', '/var/task')
-        engine_script = os.path.join(task_root, engine)
+        # Execute
+        args = shlex.split(command)
+        result_str, err_str = run_engine(engine, args, extra)
         
-        if not os.path.exists(engine_script):
-            logger.error(f"Engine script not found: {engine}", extra=extra)
-            return {'statusCode': 404, 'body': json.dumps({'error': f"Engine script not found: {engine}"})}
+        if result_str is None:
+            logger.error(f"Skill submission failed: {err_str}", extra=extra)
+            return {'statusCode': 500, 'body': json.dumps({'error': err_str})}
 
-        env = os.environ.copy()
-        env['PYTHONPATH'] = f"{task_root}/lib:" + env.get('PYTHONPATH', '')
-        
-        # 2. Run the submission command in a temporary directory (stateless)
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            args = shlex.split(command)
-            process = subprocess.run(["python3", engine_script] + args, 
-                                   cwd=tmp_dir, capture_output=True, text=True, env=env)
-            
-            result_str = process.stdout if process.returncode == 0 else process.stderr
-            
-            if process.returncode != 0:
-                logger.error(f"Skill submission failed (code {process.returncode}): {process.stderr}", extra=extra)
-                return {'statusCode': 500, 'body': json.dumps({'error': result_str})}
+        if err_str:
+            logger.info(f"Skill stderr output:\n{err_str}", extra=extra)
 
-            # 3. Parse Task ID and queue for monitoring
-            try:
-                result_json = json.loads(result_str)
-                task_id = result_json.get('id')
-                if task_id:
-                    extra["task_id"] = task_id
-                    
-                    # Capture any engine-provided metadata for persistence
-                    engine_meta = result_json.get('_metadata', {})
-                    if engine_meta:
-                        metadata.update(engine_meta)
+        # Parse Task ID and queue for monitoring
+        try:
+            result_json = json.loads(result_str)
+            task_id = result_json.get('id')
+            if task_id:
+                extra["task_id"] = task_id
+                engine_meta = result_json.get('_metadata', {})
+                if engine_meta:
+                    metadata.update(engine_meta)
 
-                    if QUEUE_URL:
-                        monitor_msg = {
-                            "type": "monitor_task",
-                            "chat_id": chat_id,
-                            "skill": skill,
-                            "engine": engine,
-                            "task_id": task_id,
-                            "metadata": metadata,
-                            "original_result": result_json
-                        }
-                        logger.info(f"Task accepted. Queuing monitor message for task_id: {task_id}", extra=extra)
-                        sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(monitor_msg), MessageGroupId=str(chat_id))
-                else:
-                    logger.warning("Submission succeeded but no task ID found in output", extra=extra)
-            except Exception as e:
-                logger.warning(f"Failed to parse submission result JSON: {e}", extra=extra)
+                if QUEUE_URL:
+                    monitor_msg = {
+                        "type": "monitor_task",
+                        "chat_id": chat_id,
+                        "skill": skill,
+                        "engine": engine,
+                        "task_id": task_id,
+                        "metadata": metadata,
+                        "original_result": result_json
+                    }
+                    logger.info(f"Task accepted. Queuing monitor message for task_id: {task_id}", extra=extra)
+                    sqs.send_message(QueueUrl=QUEUE_URL, MessageBody=json.dumps(monitor_msg), MessageGroupId=str(chat_id))
+            else:
+                logger.warning("Submission succeeded but no task ID found in output", extra=extra)
+        except Exception as e:
+            logger.warning(f"Failed to parse submission result JSON: {e}", extra=extra)
 
-            return {'statusCode': 200, 'body': result_str}
+        return {'statusCode': 200, 'body': result_str}
 
     except Exception as e:
         logger.error(f"HTTP Handler Error: {e}", extra=extra, exc_info=True)
@@ -131,51 +171,45 @@ def sqs_handler(event, context):
             chat_id = msg.get('chat_id')
             metadata = msg.get('metadata', {})
             
-            # Extract SQS retry count
             attr = record.get('attributes', {})
             retry_count = attr.get('ApproximateReceiveCount', '1')
             
             extra = {"task_id": task_id, "request_id": req_id, "chat_id": chat_id}
             logger.info(f"Checking task status (Attempt {retry_count})", extra=extra)
             
-            task_root = os.environ.get('LAMBDA_TASK_ROOT', '/var/task')
-            engine_script = os.path.join(task_root, engine)
+            # Execute check
+            check_output, err_str = run_engine(engine, ["check", "--id", task_id], extra)
             
-            env = os.environ.copy()
-            env['PYTHONPATH'] = f"{task_root}/lib:" + env.get('PYTHONPATH', '')
+            if check_output is None:
+                logger.error(f"Status check failed: {err_str}", extra=extra)
+                raise Exception(err_str)
+
+            if err_str:
+                logger.info(f"Skill stderr output:\n{err_str}", extra=extra)
+
+            try:
+                check_res = json.loads(check_output)
+                done = check_res.get('done') or check_res.get('finished') == 1
+                faulted = check_res.get('faulted') or check_res.get('error')
+                
+                if done or faulted:
+                    logger.info(f"Task completed (success={done}, error={bool(faulted)}). Sending result to worker.", extra=extra)
+                    if RESULT_QUEUE_URL:
+                        result_msg = {
+                            "type": "task_result",
+                            "task_id": task_id,
+                            "chat_id": chat_id,
+                            "skill": skill,
+                            "metadata": metadata,
+                            "result": check_output,
+                            "is_error": bool(faulted)
+                        }
+                        sqs.send_message(QueueUrl=RESULT_QUEUE_URL, MessageBody=json.dumps(result_msg), MessageGroupId=str(chat_id))
+                    return
+            except Exception as e:
+                logger.error(f"Failed to parse engine check output: {check_output}", extra=extra)
             
-            # Polling check in a temporary directory
-            import tempfile
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                check_process = subprocess.run(["python3", engine_script, "check", "--id", task_id], 
-                                            cwd=tmp_dir, capture_output=True, text=True, env=env)
-                
-                try:
-                    check_res = json.loads(check_process.stdout)
-                    done = check_res.get('done') or check_res.get('finished') == 1
-                    faulted = check_res.get('faulted') or check_res.get('error')
-                    
-                    if done or faulted:
-                        logger.info(f"Task completed (success={done}, error={bool(faulted)}). Sending result to worker.", extra=extra)
-                        if RESULT_QUEUE_URL:
-                            result_msg = {
-                                "type": "task_result",
-                                "task_id": task_id,
-                                "chat_id": chat_id,
-                                "skill": skill,
-                                "metadata": metadata,
-                                "result": check_process.stdout,
-                                "is_error": bool(faulted)
-                            }
-                            sqs.send_message(QueueUrl=RESULT_QUEUE_URL, MessageBody=json.dumps(result_msg), MessageGroupId=str(chat_id))
-                        else:
-                            logger.critical(f"RESULT_QUEUE_URL not configured. Cannot send result for task {task_id}", extra=extra)
-                        return
-                except Exception as e:
-                    logger.error(f"Failed to parse engine check output: {check_process.stdout}", extra=extra)
-                
-                # Still in progress -> retry via Visibility Timeout
-                raise Exception(f"Task {task_id} not finished yet")
+            raise Exception(f"Task {task_id} not finished yet")
         
         except Exception as e:
             if "not finished yet" in str(e):
