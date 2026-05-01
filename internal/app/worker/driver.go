@@ -160,8 +160,6 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 	var finalContent string
 	var sentMessages []string
 	totalUsage := make(map[string]providers.UsageInfo)
-
-	// Simple active model selection (ignore routing for now, or implement if needed)
 	activeModel := inst.Model
 
 	for {
@@ -171,91 +169,22 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 			break
 		}
 
-		// Check for soft timeout (leave 10s for the final LLM summary or graceful exit)
-		if deadline, ok := ctx.Deadline(); ok {
-			if time.Until(deadline) < 10*time.Second {
-				log.Ctx(ctx).Warn().Msg("Soft timeout reached, stopping iterations")
-				break
-			}
-		}
-
-		providerToolDefs := inst.Tools.ToProviderDefs()
-
-		llmOpts := map[string]any{
+		// 1. Prepare and Call LLM
+		iterMessages := d.prepareIterationMessages(ctx, messages)
+		response, err := inst.Provider.Chat(ctx, iterMessages, inst.Tools.ToProviderDefs(), activeModel, map[string]any{
 			"max_tokens":       inst.MaxTokens,
 			"temperature":      inst.Temperature,
 			"prompt_cache_key": inst.ID,
-		}
-
-		// Inject dynamic time hint to help agent plan its iterations
-		iterMessages := messages
-		if deadline, ok := ctx.Deadline(); ok {
-			remaining := time.Until(deadline).Round(time.Second)
-			hint := fmt.Sprintf("System: Remaining time: %s.", remaining)
-			if remaining < 20*time.Second {
-				hint += " Time is CRITICAL. Wrap up and provide the final answer NOW."
-			} else {
-				hint += " Plan your tool calls accordingly."
-			}
-
-			iterMessages = append([]providers.Message{}, messages...)
-			iterMessages = append(iterMessages, providers.Message{
-				Role:    "system",
-				Content: hint,
-			})
-		}
-
-		log.Ctx(ctx).Debug().
-			Interface("messages", iterMessages).
-			Interface("tools", providerToolDefs).
-			Str("activeModel", activeModel).
-			Interface("llmOpts", llmOpts).
-			Msg("Sending request to LLM")
-
-		response, err := inst.Provider.Chat(ctx, iterMessages, providerToolDefs, activeModel, llmOpts)
+		})
 		if err != nil {
 			return "", iteration, sentMessages, totalUsage, fmt.Errorf("LLM call failed: %w", err)
 		}
 
-		// Accumulate and log usage for this iteration
-		if response.Usage != nil {
-			u := totalUsage[activeModel]
-			u.PromptTokens += response.Usage.PromptTokens
-			u.CompletionTokens += response.Usage.CompletionTokens
-			u.TotalTokens += response.Usage.TotalTokens
-			totalUsage[activeModel] = u
+		// 2. Track usage and handle reasoning
+		d.trackUsage(ctx, response.Usage, totalUsage, activeModel, iteration, opts.ChatID)
+		d.handleReasoning(ctx, response.Reasoning, opts)
 
-			log.Ctx(ctx).Info().
-				Str("chat_id", opts.ChatID).
-				Str("model", activeModel).
-				Int("iteration", iteration).
-				Int("prompt_tokens", response.Usage.PromptTokens).
-				Int("completion_tokens", response.Usage.CompletionTokens).
-				Int("total_tokens", response.Usage.TotalTokens).
-				Msg("Iteration usage")
-		}
-
-		// Handle reasoning (async best-effort)
-		if response.Reasoning != "" {
-			// Always log reasoning to system log
-			log.Ctx(ctx).Info().
-				Str("chat_id", opts.ChatID).
-				Str("reasoning", response.Reasoning).
-				Msg("Agent reasoning")
-
-			if !opts.SuppressReasoning {
-				go func() {
-					pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-					_ = d.Bus.PublishOutbound(pubCtx, bus.OutboundMessage{
-						Channel: opts.Channel,
-						ChatID:  opts.ChatID,
-						Content: response.Reasoning,
-					})
-				}()
-			}
-		}
-
+		// 3. Termination check
 		if len(response.ToolCalls) == 0 {
 			finalContent = response.Content
 			if finalContent == "" && response.ReasoningContent != "" {
@@ -264,142 +193,223 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 			break
 		}
 
-		// Process Tool Calls
-		assistantMsg := providers.Message{
-			Role:             "assistant",
-			Content:          response.Content,
-			ReasoningContent: response.ReasoningContent,
-		}
+		// 4. Dispatch and execute tools
+		batch := d.dispatchTools(ctx, inst, response, opts, iteration)
 
-		for _, tc := range response.ToolCalls {
-			tcNorm := providers.NormalizeToolCall(tc)
-			argsJSON, _ := json.Marshal(tcNorm.Arguments)
-			assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
-				ID:   tcNorm.ID,
-				Type: "function",
-				Name: tcNorm.Name,
-				Function: &providers.FunctionCall{
-					Name:             tcNorm.Name,
-					Arguments:        string(argsJSON),
-					ThoughtSignature: tcNorm.ThoughtSignature,
-				},
-				ExtraContent:     tcNorm.ExtraContent,
-				ThoughtSignature: tcNorm.ThoughtSignature,
-			})
-		}
-
-		// Add to local history for the next generation in THIS turn
-		messages = append(messages, assistantMsg)
-
-		// Log tool calls
-		for _, tc := range assistantMsg.ToolCalls {
-			log.Ctx(ctx).Info().
-				Str("chat_id", opts.ChatID).
-				Str("tool", tc.Name).
-				Str("tool_call_id", tc.ID).
-				Str("arguments", tc.Function.Arguments).
-				Int("iteration", iteration).
-				Msg("Tool call")
-		}
-
-		// Execute tools in parallel
-		type result struct {
-			idx int
-			res *tools.ToolResult
-			tc  providers.ToolCall
-		}
-		results := make([]result, len(assistantMsg.ToolCalls))
-		var wg sync.WaitGroup
-		for i, tc := range assistantMsg.ToolCalls {
-			wg.Add(1)
-			go func(idx int, t providers.ToolCall) {
-				defer wg.Done()
-				var args map[string]any
-				_ = json.Unmarshal([]byte(t.Function.Arguments), &args)
-				// Manually inject message context since picoclaw library doesn't do it in ExecuteWithContext
-				toolCtx := tools.WithToolInboundContext(ctx, opts.Channel, opts.ChatID, opts.MessageID, "")
-				res := inst.Tools.ExecuteWithContext(toolCtx, t.Name, args, opts.Channel, opts.ChatID, nil)
-				results[idx] = result{idx: idx, res: res, tc: t}
-			}(i, tc)
-		}
-		wg.Wait()
-
-		// Save Assistant message to session ONLY after we have results ready to follow it
+		// 5. Save assistant message and update local state
+		messages = append(messages, batch.assistantMsg)
 		if !opts.DisableHistory {
-			inst.Sessions.AddFullMessage(opts.SessionKey, assistantMsg)
+			inst.Sessions.AddFullMessage(opts.SessionKey, batch.assistantMsg)
 		}
 
-		// Handle and save results
-		for _, r := range results {
-			// Always log tool results to system log
-			log.Ctx(ctx).Info().
-				Str("chat_id", opts.ChatID).
-				Str("tool", r.tc.Name).
-				Str("tool_call_id", r.tc.ID).
-				Str("result", r.res.ForLLM).
-				Bool("is_error", r.res.IsError).
-				Bool("silent", r.res.Silent).
-				Msg("Tool result")
-
-			if r.tc.Name == "message" {
-				var args struct {
-					Content string `json:"content"`
-				}
-				_ = json.Unmarshal([]byte(r.tc.Function.Arguments), &args)
-				if args.Content != "" {
-					sentMessages = append(sentMessages, args.Content)
-				}
-			}
-
-			// Immediate feedback for user if not silent and not suppressed
-			if !opts.SuppressToolFeedback && !r.res.Silent && r.res.ForUser != "" {
-				_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Content: r.res.ForUser,
-				})
-			}
-
-			// Media results
-			if len(r.res.Media) > 0 {
-				parts := make([]bus.MediaPart, 0, len(r.res.Media))
-				for _, ref := range r.res.Media {
-					part := bus.MediaPart{Ref: ref}
-					if d.MediaStore != nil {
-						if _, meta, err := d.MediaStore.ResolveWithMeta(ref); err == nil {
-							part.Filename = meta.Filename
-							part.ContentType = meta.ContentType
-							part.Type = tgutil.InferMediaType(meta.Filename, meta.ContentType)
-						}
-					}
-					parts = append(parts, part)
-				}
-				_ = d.Bus.PublishOutboundMedia(ctx, bus.OutboundMediaMessage{
-					Channel: opts.Channel,
-					ChatID:  opts.ChatID,
-					Parts:   parts,
-				})
-			}
-
-			contentForLLM := r.res.ForLLM
-			if contentForLLM == "" && r.res.Err != nil {
-				contentForLLM = r.res.Err.Error()
-			}
-			toolResultMsg := providers.Message{
-				Role:       "tool",
-				Content:    contentForLLM,
-				ToolCallID: r.tc.ID,
-			}
-			messages = append(messages, toolResultMsg)
-			if !opts.DisableHistory {
-				inst.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
-			}
-		}
+		// 6. Process tool outputs
+		d.applyToolResults(ctx, inst, batch.results, &messages, &sentMessages, opts)
 
 		inst.Tools.TickTTL()
 	}
 
 	return finalContent, iteration, sentMessages, totalUsage, nil
+}
+
+func (d *Driver) prepareIterationMessages(ctx context.Context, messages []providers.Message) []providers.Message {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+
+		var timeStr string
+		if remaining > time.Minute {
+			// Round to the nearest minute to keep the prompt stable for caching
+			timeStr = fmt.Sprintf("%d minutes", int(remaining.Round(time.Minute).Minutes()))
+		} else {
+			timeStr = "less than a minute"
+		}
+
+		hint := fmt.Sprintf("System: Remaining time for this task: %s.", timeStr)
+		if remaining < 30*time.Second {
+			hint += " Time is CRITICAL. Wrap up and provide the final answer NOW."
+		} else {
+			hint += " Plan your tool calls accordingly."
+		}
+
+		iterMessages := append([]providers.Message{}, messages...)
+		return append(iterMessages, providers.Message{
+			Role:    "system",
+			Content: hint,
+		})
+	}
+	return messages
+}
+
+func (d *Driver) trackUsage(ctx context.Context, usage *providers.UsageInfo, total map[string]providers.UsageInfo, model string, iter int, chatID string) {
+	if usage == nil {
+		return
+	}
+	u := total[model]
+	u.PromptTokens += usage.PromptTokens
+	u.CompletionTokens += usage.CompletionTokens
+	u.TotalTokens += usage.TotalTokens
+	total[model] = u
+
+	log.Ctx(ctx).Info().
+		Str("chat_id", chatID).
+		Str("model", model).
+		Int("iteration", iter).
+		Int("prompt_tokens", usage.PromptTokens).
+		Int("completion_tokens", usage.CompletionTokens).
+		Int("total_tokens", usage.TotalTokens).
+		Msg("Iteration usage")
+}
+
+func (d *Driver) handleReasoning(ctx context.Context, reasoning string, opts processOptions) {
+	if reasoning == "" {
+		return
+	}
+	log.Ctx(ctx).Info().Str("chat_id", opts.ChatID).Str("reasoning", reasoning).Msg("Agent reasoning")
+
+	if !opts.SuppressReasoning {
+		go func() {
+			pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = d.Bus.PublishOutbound(pubCtx, bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: reasoning,
+			})
+		}()
+	}
+}
+
+type toolResultBatch struct {
+	assistantMsg providers.Message
+	results      []toolExecutionResult
+}
+
+type toolExecutionResult struct {
+	tc     providers.ToolCall
+	result *tools.ToolResult
+}
+
+func (d *Driver) dispatchTools(ctx context.Context, inst *agent.AgentInstance, response *providers.LLMResponse, opts processOptions, iter int) toolResultBatch {
+	assistantMsg := providers.Message{
+		Role:             "assistant",
+		Content:          response.Content,
+		ReasoningContent: response.ReasoningContent,
+	}
+
+	for _, tc := range response.ToolCalls {
+		tcNorm := providers.NormalizeToolCall(tc)
+		argsJSON, _ := json.Marshal(tcNorm.Arguments)
+		assistantMsg.ToolCalls = append(assistantMsg.ToolCalls, providers.ToolCall{
+			ID:   tcNorm.ID,
+			Type: "function",
+			Name: tcNorm.Name,
+			Function: &providers.FunctionCall{
+				Name:             tcNorm.Name,
+				Arguments:        string(argsJSON),
+				ThoughtSignature: tcNorm.ThoughtSignature,
+			},
+			ExtraContent:     tcNorm.ExtraContent,
+			ThoughtSignature: tcNorm.ThoughtSignature,
+		})
+	}
+
+	for _, tc := range assistantMsg.ToolCalls {
+		log.Ctx(ctx).Info().
+			Str("chat_id", opts.ChatID).
+			Str("tool", tc.Name).
+			Str("tool_call_id", tc.ID).
+			Str("arguments", tc.Function.Arguments).
+			Int("iteration", iter).
+			Msg("Tool call")
+	}
+
+	batch := toolResultBatch{
+		assistantMsg: assistantMsg,
+		results:      make([]toolExecutionResult, len(assistantMsg.ToolCalls)),
+	}
+
+	var wg sync.WaitGroup
+	for i, tc := range assistantMsg.ToolCalls {
+		wg.Add(1)
+		go func(idx int, t providers.ToolCall) {
+			defer wg.Done()
+			var args map[string]any
+			_ = json.Unmarshal([]byte(t.Function.Arguments), &args)
+			toolCtx := tools.WithToolInboundContext(ctx, opts.Channel, opts.ChatID, opts.MessageID, "")
+			res := inst.Tools.ExecuteWithContext(toolCtx, t.Name, args, opts.Channel, opts.ChatID, nil)
+			batch.results[idx] = toolExecutionResult{tc: t, result: res}
+		}(i, tc)
+	}
+	wg.Wait()
+	return batch
+}
+
+func (d *Driver) applyToolResults(ctx context.Context, inst *agent.AgentInstance, results []toolExecutionResult, messages *[]providers.Message, sentMessages *[]string, opts processOptions) {
+	for _, r := range results {
+		log.Ctx(ctx).Info().
+			Str("chat_id", opts.ChatID).
+			Str("tool", r.tc.Name).
+			Str("tool_call_id", r.tc.ID).
+			Str("result", r.result.ForLLM).
+			Bool("is_error", r.result.IsError).
+			Msg("Tool result")
+
+		if r.tc.Name == "message" {
+			var args struct {
+				Content string `json:"content"`
+			}
+			_ = json.Unmarshal([]byte(r.tc.Function.Arguments), &args)
+			if args.Content != "" {
+				*sentMessages = append(*sentMessages, args.Content)
+			}
+		}
+
+		if !opts.SuppressToolFeedback && !r.result.Silent && r.result.ForUser != "" {
+			_ = d.Bus.PublishOutbound(ctx, bus.OutboundMessage{
+				Channel: opts.Channel,
+				ChatID:  opts.ChatID,
+				Content: r.result.ForUser,
+			})
+		}
+
+		if len(r.result.Media) > 0 {
+			d.publishMedia(ctx, opts, r.result.Media)
+		}
+
+		contentForLLM := r.result.ForLLM
+		if contentForLLM == "" && r.result.Err != nil {
+			contentForLLM = r.result.Err.Error()
+		}
+
+		toolResultMsg := providers.Message{
+			Role:       "tool",
+			Content:    contentForLLM,
+			ToolCallID: r.tc.ID,
+		}
+		*messages = append(*messages, toolResultMsg)
+		if !opts.DisableHistory {
+			inst.Sessions.AddFullMessage(opts.SessionKey, toolResultMsg)
+		}
+	}
+}
+
+func (d *Driver) publishMedia(ctx context.Context, opts processOptions, mediaRefs []string) {
+	parts := make([]bus.MediaPart, 0, len(mediaRefs))
+	for _, ref := range mediaRefs {
+		part := bus.MediaPart{Ref: ref}
+		if d.MediaStore != nil {
+			if _, meta, err := d.MediaStore.ResolveWithMeta(ref); err == nil {
+				part.Filename = meta.Filename
+				part.ContentType = meta.ContentType
+				part.Type = tgutil.InferMediaType(meta.Filename, meta.ContentType)
+			}
+		}
+		parts = append(parts, part)
+	}
+	_ = d.Bus.PublishOutboundMedia(ctx, bus.OutboundMediaMessage{
+		Channel: opts.Channel,
+		ChatID:  opts.ChatID,
+		Parts:   parts,
+	})
 }
 
 func (d *Driver) resolveMediaRefs(messages []providers.Message, maxSize int64) []providers.Message {

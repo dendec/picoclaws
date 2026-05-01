@@ -180,13 +180,22 @@ func (a *WorkerApp) Handle(ctx context.Context, sqsEvent events.SQSEvent) error 
 
 	for _, record := range sqsEvent.Records {
 		if err := a.processSQSRecord(ctx, record); err != nil {
-			logger.Error().Str("message_id", record.MessageId).Err(err).Msg("Failed to process SQS record")
+			log.Ctx(ctx).Error().Str("message_id", record.MessageId).Err(err).Msg("Failed to process SQS record")
 		}
 	}
 	return nil
 }
 
 func (a *WorkerApp) processSQSRecord(ctx context.Context, record events.SQSMessage) error {
+	logger := log.Ctx(ctx).With().Str("sqs_message_id", record.MessageId).Logger()
+	ctx = logger.WithContext(ctx)
+
+	var msg map[string]any
+	if err := json.Unmarshal([]byte(record.Body), &msg); err != nil {
+		logger.Error().Err(err).Msg("Failed to unmarshal SQS message body")
+		return nil
+	}
+
 	// 1. Heartbeat check
 	handled, err := a.tryHandleHeartbeat(ctx, record)
 	if handled {
@@ -340,134 +349,44 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		var err error
 		s3Storage, err = aws.NewS3Storage(ctx, bucket)
 		if err != nil {
-			logger.Error().Err(err).Msg("Failed to initialize S3 storage")
+			log.Ctx(ctx).Error().Err(err).Msg("Failed to initialize S3 storage")
 		}
 	}
 
 	chatWorkspace := a.getWorkspacePath(chatID)
 
-	// 1. Prepare Workspace (S3 + Assets)
+	// 1. Prepare Workspace (Download from S3)
 	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	if err != nil {
 		return err
 	}
 
-	// 1.5 Restore task metadata if present (must happen AFTER prepareWorkspace)
-	if len(taskMetadata) > 0 {
-		taskID := ""
-		// Try to extract task ID from the message content or metadata itself
-		// In processSQSRecord we know it's TaskResultMessage, but here we just have the map.
-		// Actually, let's just use a special key in metadata for TaskID if possible,
-		// or rely on the fact that for TaskResult it was already in tr.TaskID.
-		// Let's modify TaskResultMessage to include TaskID in its metadata map too just in case.
-		if id, ok := taskMetadata["_task_id"].(string); ok {
-			taskID = id
-		}
+	// 2. Setup Context and Environment
+	a.restoreTaskMetadata(ctx, chatWorkspace, taskMetadata)
+	a.configureEnvironment(chatWorkspace)
 
-		if taskID != "" {
-			metaStr, _ := json.Marshal(taskMetadata)
-			jobDir := filepath.Join(chatWorkspace, "memory", "jobs")
-			_ = os.MkdirAll(jobDir, 0755)
-			_ = os.WriteFile(filepath.Join(jobDir, fmt.Sprintf("%s.json", taskID)), metaStr, 0644)
-			logger.Debug().Str("task_id", taskID).Msg("Restored task metadata to workspace")
-		}
-	}
-
-	// 2. Setup isolated Python environment inside workspace
-	pythonPackagesDir := filepath.Join(chatWorkspace, ".python_packages")
-	_ = os.MkdirAll(pythonPackagesDir, 0755)
-
-	// Set environment variables for the agent and its tools
-	os.Setenv("HOME", chatWorkspace)
-	os.Setenv("PIP_TARGET", pythonPackagesDir)
-	os.Setenv("PIP_NO_CACHE_DIR", "1")
-
-	// Prepend workspace packages to PYTHONPATH
-	newPyPath := pythonPackagesDir
-	if a.initPyPath != "" {
-		newPyPath = pythonPackagesDir + ":" + a.initPyPath
-	}
-	os.Setenv("PYTHONPATH", newPyPath)
-
-	logger.Debug().
-		Str("home", os.Getenv("HOME")).
-		Str("pythonpath", os.Getenv("PYTHONPATH")).
-		Str("pip_target", os.Getenv("PIP_TARGET")).
-		Msg("Isolated environment configured for workspace")
-
-	// 3. Check for heartbeat tasks (AFTER workspace is ready on disk)
 	if isHeartbeat {
 		inMsg.Content = a.buildHeartbeatPrompt()
 	}
 
-	// 4. Create Isolated Agent
+	// 3. Create Agent
 	agentInst, err := a.createAgent(chatID, chatWorkspace)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
 	defer agentInst.Close()
 
-	// 5. Initialize USER.md for fresh workspaces
 	if isNew {
 		a.initUserMetadata(chatWorkspace, inMsg)
 	}
 
-	// 6. Materialize inbound media into workspace inbox
-	if len(inMsg.Media) > 0 {
-		inboxDir := filepath.Join(chatWorkspace, "inbox")
-		_ = os.MkdirAll(inboxDir, 0755)
-		var attachedFiles []string
-		for _, ref := range inMsg.Media {
-			path, meta, err := a.MediaStore.ResolveWithMeta(ref)
-			if err != nil {
-				logger.Warn().Err(err).Str("ref", ref).Msg("Failed to resolve media ref for inbox")
-				continue
-			}
+	// 4. Ingest Media
+	a.materializeMedia(ctx, chatWorkspace, inMsg)
 
-			destName := meta.Filename
-			if destName == "" {
-				destName = filepath.Base(path)
-			}
-			destPath := filepath.Join(inboxDir, destName)
-
-			// Copy file from media store to inbox
-			err = func() error {
-				src, err := os.Open(path)
-				if err != nil {
-					return err
-				}
-				defer src.Close()
-
-				dst, err := os.Create(destPath)
-				if err != nil {
-					return err
-				}
-				defer dst.Close()
-
-				_, err = io.Copy(dst, src)
-				return err
-			}()
-
-			if err != nil {
-				logger.Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
-			} else {
-				logger.Debug().Str("file", destName).Msg("Media materialized in inbox")
-				attachedFiles = append(attachedFiles, destName)
-			}
-		}
-
-		if len(attachedFiles) > 0 {
-			if inMsg.Content != "" {
-				inMsg.Content += "\n\n"
-			}
-			inMsg.Content += "[System: User attached files in inbox/: " + strings.Join(attachedFiles, ", ") + "]"
-		}
-	}
-
-	// 7. Execute Turn
+	// 5. Execute Turn
 	processErr, modified := a.executeTurn(ctx, agentInst, inMsg, chatWorkspace, isHeartbeat)
 
-	// 8. Finalize Workspace (S3 + Cleanup)
+	// 6. Finalize (Upload to S3)
 	if modified {
 		a.finalizeWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	} else {
@@ -476,6 +395,95 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 
 	return processErr
 }
+
+func (a *WorkerApp) restoreTaskMetadata(ctx context.Context, chatWorkspace string, taskMetadata map[string]any) {
+	if len(taskMetadata) == 0 {
+		return
+	}
+
+	taskID, ok := taskMetadata["_task_id"].(string)
+	if !ok || taskID == "" {
+		return
+	}
+
+	metaStr, _ := json.Marshal(taskMetadata)
+	jobDir := filepath.Join(chatWorkspace, "memory", "jobs")
+	_ = os.MkdirAll(jobDir, 0755)
+	_ = os.WriteFile(filepath.Join(jobDir, fmt.Sprintf("%s.json", taskID)), metaStr, 0644)
+	log.Ctx(ctx).Debug().Str("task_id", taskID).Msg("Restored task metadata to workspace")
+}
+
+func (a *WorkerApp) configureEnvironment(chatWorkspace string) {
+	pythonPackagesDir := filepath.Join(chatWorkspace, ".python_packages")
+	_ = os.MkdirAll(pythonPackagesDir, 0755)
+
+	os.Setenv("HOME", chatWorkspace)
+	os.Setenv("PIP_TARGET", pythonPackagesDir)
+	os.Setenv("PIP_NO_CACHE_DIR", "1")
+
+	newPyPath := pythonPackagesDir
+	if a.initPyPath != "" {
+		newPyPath = pythonPackagesDir + ":" + a.initPyPath
+	}
+	os.Setenv("PYTHONPATH", newPyPath)
+}
+
+func (a *WorkerApp) materializeMedia(ctx context.Context, chatWorkspace string, inMsg *bus.InboundMessage) {
+	if len(inMsg.Media) == 0 {
+		return
+	}
+
+	inboxDir := filepath.Join(chatWorkspace, "inbox")
+	_ = os.MkdirAll(inboxDir, 0755)
+	var attachedFiles []string
+
+	for _, ref := range inMsg.Media {
+		path, meta, err := a.MediaStore.ResolveWithMeta(ref)
+		if err != nil {
+			log.Ctx(ctx).Warn().Err(err).Str("ref", ref).Msg("Failed to resolve media ref for inbox")
+			continue
+		}
+
+		destName := meta.Filename
+		if destName == "" {
+			destName = filepath.Base(path)
+		}
+		destPath := filepath.Join(inboxDir, destName)
+
+		err = func() error {
+			src, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer src.Close()
+
+			dst, err := os.Create(destPath)
+			if err != nil {
+				return err
+			}
+			defer dst.Close()
+
+			_, err = io.Copy(dst, src)
+			return err
+		}()
+
+		if err != nil {
+			log.Ctx(ctx).Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
+		} else {
+			attachedFiles = append(attachedFiles, destName)
+		}
+	}
+
+	if len(attachedFiles) > 0 {
+		hint := "[System: User attached files in inbox/: " + strings.Join(attachedFiles, ", ") + "]"
+		if inMsg.Content != "" {
+			inMsg.Content += "\n\n" + hint
+		} else {
+			inMsg.Content = hint
+		}
+	}
+}
+
 
 func (a *WorkerApp) buildHeartbeatPrompt() string {
 	now := time.Now().Format("2006-01-02 15:04:05")

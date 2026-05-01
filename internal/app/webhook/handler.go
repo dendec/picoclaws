@@ -120,7 +120,7 @@ func (a *WebhookApp) Handle(ctx context.Context, event events.LambdaFunctionURLR
 		Logger()
 	ctx = logger.WithContext(ctx)
 
-	log.Info().
+	log.Ctx(ctx).Info().
 		Str("domain", event.RequestContext.DomainName).
 		Bool("auto_setup", a.AutoSetup).
 		Msg("Handling webhook request")
@@ -128,11 +128,11 @@ func (a *WebhookApp) Handle(ctx context.Context, event events.LambdaFunctionURLR
 	if a.AutoSetup {
 		a.setupOnce.Do(func() {
 			webhookURL := "https://" + event.RequestContext.DomainName + "/"
-			log.Info().
+			log.Ctx(ctx).Info().
 				Str("url", webhookURL).
 				Msg("Triggering dynamic bot setup")
 			if err := a.EnsureSetup(ctx, webhookURL); err != nil {
-				log.Error().Err(err).Msg("Failed to run dynamic bot setup")
+				log.Ctx(ctx).Error().Err(err).Msg("Failed to run dynamic bot setup")
 			}
 		})
 	}

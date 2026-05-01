@@ -13,6 +13,8 @@ import (
 	"picoclaws/internal/platform/aws"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/rs/zerolog/log"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -68,8 +70,13 @@ func (a *HeartbeatApp) Handle(ctx context.Context, event events.CloudWatchEvent)
 
 	logger.Info().Int("total", len(metadata)).Msg("Discovered workspaces for heartbeat analysis")
 
-	skipped := 0
-	sent := 0
+	var skipped int64
+	var sent int64
+	
+	const maxConcurrency = 10
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+
 	for _, meta := range metadata {
 		// Key format: workspaces/<chatID>.tar.zst
 		base := filepath.Base(meta.Key)
@@ -79,26 +86,39 @@ func (a *HeartbeatApp) Handle(ctx context.Context, event events.CloudWatchEvent)
 		}
 
 		// Optimization: skip workspaces that haven't been modified for a while.
-		// If a workspace is old, it means there are no new messages and previous heartbeats
-		// didn't find anything to update (otherwise they would have re-uploaded the workspace).
 		if time.Since(time.Unix(meta.LastModified, 0)) > InactivityThreshold {
-			skipped++
+			atomic.AddInt64(&skipped, 1)
 			continue
 		}
 
-		// 2. Send individual heartbeat message to SQS
-		hb := HeartbeatMessage{Type: "heartbeat", ChatID: chatID}
-		body, _ := json.Marshal(hb)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			
+			// Acquire semaphore
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
 
-		if err := a.SQS.SendMessage(ctx, string(body), chatID); err != nil {
-			logger.Warn().Str("chat_id", chatID).Err(err).Msg("Failed to fan-out heartbeat")
-		} else {
-			sent++
-			logger.Debug().Str("chat_id", chatID).Msg("Heartbeat task sent to SQS")
-		}
+			// 2. Send individual heartbeat message to SQS
+			hb := HeartbeatMessage{Type: "heartbeat", ChatID: id}
+			body, _ := json.Marshal(hb)
+
+			if err := a.SQS.SendMessage(ctx, string(body), id); err != nil {
+				logger.Warn().Str("chat_id", id).Err(err).Msg("Failed to fan-out heartbeat")
+			} else {
+				atomic.AddInt64(&sent, 1)
+				logger.Debug().Str("chat_id", id).Msg("Heartbeat task sent to SQS")
+			}
+		}(chatID)
 	}
 
-	logger.Info().Int("sent", sent).Int("skipped", skipped).Msg("Heartbeat fan-out complete")
+	wg.Wait()
+
+	logger.Info().Int64("sent", sent).Int64("skipped", skipped).Msg("Heartbeat fan-out complete")
 
 	return nil
 }
