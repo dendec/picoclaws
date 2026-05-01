@@ -19,10 +19,38 @@ import (
 
 // EquipAgent adds shared tools (web, send_file, message, etc.) to an agent instance.
 // This is a local implementation moved from the picoclaw library to allow customization.
-func (a *WorkerApp) EquipAgent(inst *agent.AgentInstance, chatID string) {
+func (a *WorkerApp) EquipAgent(ctx context.Context, inst *agent.AgentInstance, chatID string) {
 	cfg := a.Agent.GetConfig()
 	msgBus := a.Bus
 	allowReadPaths := buildAllowReadPatterns(cfg)
+
+	// 0. MCP Tools (initialize and register)
+	if cfg.Tools.IsToolEnabled("mcp") {
+		if err := a.Agent.EnsureMCPInitialized(ctx); err == nil {
+			if mcpManager := a.Agent.GetMCPManager(); mcpManager != nil {
+				servers := mcpManager.GetServers()
+				for serverName, conn := range servers {
+					serverCfg := cfg.Tools.MCP.Servers[serverName]
+					// Note: Discovery support could be added here if needed,
+					// but for now we register all tools from enabled servers.
+					for _, tool := range conn.Tools {
+						mcpTool := tools.NewMCPTool(mcpManager, serverName, tool)
+						mcpTool.SetWorkspace(inst.Workspace)
+						mcpTool.SetMaxInlineTextRunes(cfg.Tools.MCP.GetMaxInlineTextChars())
+
+						// Check if it should be hidden (deferred)
+						if serverCfg.Deferred != nil && *serverCfg.Deferred {
+							inst.Tools.RegisterHidden(mcpTool)
+						} else {
+							inst.Tools.Register(mcpTool)
+						}
+					}
+				}
+			}
+		} else {
+			logger.ErrorCF("worker", "Failed to initialize MCP servers", map[string]any{"error": err.Error()})
+		}
+	}
 
 	// 1. Web Tools
 	if cfg.Tools.IsToolEnabled("web") {

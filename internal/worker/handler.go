@@ -409,7 +409,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	}
 
 	// 3. Create Agent
-	agentInst, err := a.createAgent(chatID, chatWorkspace)
+	agentInst, err := a.createAgent(ctx, chatID, chatWorkspace)
 	if err != nil {
 		return fmt.Errorf("create agent: %w", err)
 	}
@@ -639,7 +639,7 @@ func (a *WorkerApp) prepareWorkspace(ctx context.Context, s3Storage *aws.S3Stora
 	return !restoredFromS3, nil
 }
 
-func (a *WorkerApp) createAgent(chatID string, workspacePath string) (*agent.AgentInstance, error) {
+func (a *WorkerApp) createAgent(ctx context.Context, chatID string, workspacePath string) (*agent.AgentInstance, error) {
 	globalConfig := a.Agent.GetConfig()
 	defaultAgent := a.Agent.GetRegistry().GetDefaultAgent()
 	if defaultAgent == nil {
@@ -663,7 +663,7 @@ func (a *WorkerApp) createAgent(chatID string, workspacePath string) (*agent.Age
 	requestAgentCfg.Workspace = workspacePath
 
 	inst := agent.NewAgentInstance(&requestAgentCfg, &globalConfig.Agents.Defaults, globalConfig, defaultAgent.Provider)
-	a.EquipAgent(inst, chatID)
+	a.EquipAgent(ctx, inst, chatID)
 	return inst, nil
 }
 
