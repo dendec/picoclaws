@@ -155,6 +155,7 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 	var sentMessages []string
 	totalUsage := make(map[string]providers.UsageInfo)
 	activeModel := inst.Model
+	startTime := time.Now()
 
 	for {
 		iteration++
@@ -175,8 +176,9 @@ func (d *Driver) runIteration(ctx context.Context, inst *agent.AgentInstance, me
 		}
 
 		// 2. Track usage and handle reasoning
-		d.trackUsage(ctx, response.Usage, totalUsage, activeModel, iteration, opts.ChatID)
+		d.trackUsage(ctx, response.Usage, totalUsage, activeModel, iteration, opts.ChatID, time.Since(startTime))
 		d.handleReasoning(ctx, response.Reasoning, opts)
+		startTime = time.Now() // Reset for next iteration or tools
 
 		// 3. Termination check
 		if len(response.ToolCalls) == 0 {
@@ -233,7 +235,7 @@ func (d *Driver) prepareIterationMessages(ctx context.Context, messages []provid
 	return messages
 }
 
-func (d *Driver) trackUsage(ctx context.Context, usage *providers.UsageInfo, total map[string]providers.UsageInfo, model string, iter int, chatID string) {
+func (d *Driver) trackUsage(ctx context.Context, usage *providers.UsageInfo, total map[string]providers.UsageInfo, model string, iter int, chatID string, duration time.Duration) {
 	if usage == nil {
 		return
 	}
@@ -249,6 +251,7 @@ func (d *Driver) trackUsage(ctx context.Context, usage *providers.UsageInfo, tot
 		Int("prompt_tokens", usage.PromptTokens).
 		Int("completion_tokens", usage.CompletionTokens).
 		Int("total_tokens", usage.TotalTokens).
+		Int64("duration_ms", duration.Milliseconds()).
 		Msg("LLM response received")
 }
 
@@ -305,15 +308,7 @@ func (d *Driver) dispatchTools(ctx context.Context, inst *agent.AgentInstance, r
 		})
 	}
 
-	for _, tc := range assistantMsg.ToolCalls {
-		log.Ctx(ctx).Info().
-			Str("chat_id", opts.ChatID).
-			Str("tool", tc.Name).
-			Str("tool_call_id", tc.ID).
-			Str("arguments", tc.Function.Arguments).
-			Int("iteration", iter).
-			Msg("Tool call")
-	}
+	// Tools will be logged right before execution in the goroutine below.
 
 	batch := toolResultBatch{
 		assistantMsg: assistantMsg,
@@ -327,6 +322,14 @@ func (d *Driver) dispatchTools(ctx context.Context, inst *agent.AgentInstance, r
 			defer wg.Done()
 			var args map[string]any
 			_ = json.Unmarshal([]byte(t.Function.Arguments), &args)
+			
+			log.Ctx(ctx).Info().
+				Str("tool", t.Name).
+				Str("tool_call_id", t.ID).
+				Interface("args", args).
+				Int("iteration", iter).
+				Msg("Tool execution started")
+
 			toolCtx := tools.WithToolInboundContext(ctx, opts.Channel, opts.ChatID, opts.MessageID, "")
 			res := inst.Tools.ExecuteWithContext(toolCtx, t.Name, args, opts.Channel, opts.ChatID, nil)
 			batch.results[idx] = toolExecutionResult{tc: t, result: res}
@@ -338,13 +341,23 @@ func (d *Driver) dispatchTools(ctx context.Context, inst *agent.AgentInstance, r
 
 func (d *Driver) applyToolResults(ctx context.Context, inst *agent.AgentInstance, results []toolExecutionResult, messages *[]providers.Message, sentMessages *[]string, opts processOptions) {
 	for _, r := range results {
-		log.Ctx(ctx).Info().
-			Str("chat_id", opts.ChatID).
-			Str("tool", r.tc.Name).
+		l := log.Ctx(ctx).Info()
+		if r.result.IsError {
+			l = log.Ctx(ctx).Error()
+		}
+		
+		l = l.Str("tool", r.tc.Name).
 			Str("tool_call_id", r.tc.ID).
-			Str("result", r.result.ForLLM).
-			Bool("is_error", r.result.IsError).
-			Msg("Tool result")
+			Bool("is_error", r.result.IsError)
+
+		// Try to parse result as JSON for structured logging
+		var jsonRes any
+		if err := json.Unmarshal([]byte(r.result.ForLLM), &jsonRes); err == nil {
+			l = l.Interface("result_json", jsonRes)
+		} else {
+			l = l.Str("result", r.result.ForLLM)
+		}
+		l.Msg("Tool execution completed")
 
 		if r.tc.Name == "message" {
 			var args struct {

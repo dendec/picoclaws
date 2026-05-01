@@ -47,29 +47,37 @@ if TASK_ROOT not in sys.path:
 if f"{TASK_ROOT}/lib" not in sys.path:
     sys.path.insert(0, f"{TASK_ROOT}/lib")
 
-def run_engine(engine_rel_path, args, extra_logs):
+def run_engine(entrypoint_rel_path, args, extra_logs):
     """
     Executes a skill engine script in-process.
-    engine_rel_path: path relative to TASK_ROOT (e.g. 'skills/draw/draw_engine.py')
+    entrypoint_rel_path: path relative to TASK_ROOT
     args: list of command line arguments
     extra_logs: dict with logging context (task_id, etc.)
     """
-    engine_abs_path = os.path.join(TASK_ROOT, engine_rel_path)
-    if not os.path.exists(engine_abs_path):
-        return None, f"Engine script not found: {engine_rel_path}"
+    entrypoint_abs_path = os.path.join(TASK_ROOT, entrypoint_rel_path)
+    if not os.path.exists(entrypoint_abs_path):
+        return None, f"Entrypoint script not found: {entrypoint_rel_path}"
 
-    module_name = os.path.basename(engine_rel_path).replace(".py", "")
+    # Use unique module name to avoid collisions (e.g. skills.draw.main)
+    module_name = entrypoint_rel_path.replace("/", ".").replace(".py", "")
+    engine_dir = os.path.dirname(entrypoint_abs_path)
     
     with tempfile.TemporaryDirectory() as tmp_dir:
         orig_argv = sys.argv
-        sys.argv = [engine_abs_path] + args
+        sys.argv = [entrypoint_abs_path] + args
         
         stdout = io.StringIO()
         stderr = io.StringIO()
         
+        # Add engine directory to sys.path temporarily for internal imports (from common import ...)
+        added_to_path = False
+        if engine_dir not in sys.path:
+            sys.path.insert(0, engine_dir)
+            added_to_path = True
+            
         try:
             # Dynamic load/cache module
-            spec = importlib.util.spec_from_file_location(module_name, engine_abs_path)
+            spec = importlib.util.spec_from_file_location(module_name, entrypoint_abs_path)
             if module_name in sys.modules:
                 module = sys.modules[module_name]
             else:
@@ -81,16 +89,25 @@ def run_engine(engine_rel_path, args, extra_logs):
                 try:
                     if hasattr(module, 'main'):
                         module.main()
+                    else:
+                        # Fallback for scripts without main()
+                        exec(open(entrypoint_abs_path).read(), module.__dict__)
                 except SystemExit as e:
                     if (e.code or 0) != 0:
-                        return None, f"Exited with code {e.code}: {stderr.getvalue()}"
+                        out = stdout.getvalue()
+                        err = stderr.getvalue()
+                        combined = err if err else out
+                        return None, f"Exited with code {e.code}: {combined}"
 
             return stdout.getvalue(), stderr.getvalue()
         except Exception as e:
             logger.error(f"In-process execution failed: {e}", extra=extra_logs, exc_info=True)
-            return None, str(e)
+            # Include captured output in the exception message if possible
+            return None, f"{str(e)}\nSTDOUT: {stdout.getvalue()}\nSTDERR: {stderr.getvalue()}"
         finally:
             sys.argv = orig_argv
+            if added_to_path:
+                sys.path.remove(engine_dir)
 
 def http_handler(event, context):
     """Triggered by Function URL for immediate task submission."""
@@ -100,21 +117,21 @@ def http_handler(event, context):
     try:
         body = json.loads(event.get('body', '{}'))
         skill = body.get('skill')
-        engine = body.get('engine')
+        entrypoint = body.get('entrypoint')
         command = body.get('command')
         chat_id = body.get('chat_id')
         metadata = body.get('metadata', {})
         
         extra["chat_id"] = chat_id
         
-        if not all([skill, engine, command, chat_id]):
-            return {'statusCode': 400, 'body': json.dumps({'error': 'Missing fields'})}
+        if not all([skill, entrypoint, command, chat_id]):
+            return {'statusCode': 400, 'body': json.dumps({'error': 'Missing fields (skill, entrypoint, command, chat_id)'})}
 
-        logger.info(f"Received submission for skill '{skill}' ({engine}): {command}", extra=extra)
+        logger.info(f"Received submission for skill '{skill}' ({entrypoint}): {command}", extra=extra)
 
         # Execute
         args = shlex.split(command)
-        result_str, err_str = run_engine(engine, args, extra)
+        result_str, err_str = run_engine(entrypoint, args, extra)
         
         if result_str is None:
             logger.error(f"Skill submission failed: {err_str}", extra=extra)
@@ -138,7 +155,7 @@ def http_handler(event, context):
                         "type": "monitor_task",
                         "chat_id": chat_id,
                         "skill": skill,
-                        "engine": engine,
+                        "entrypoint": entrypoint,
                         "task_id": task_id,
                         "metadata": metadata,
                         "original_result": result_json
@@ -166,7 +183,7 @@ def sqs_handler(event, context):
             if msg.get('type') != 'monitor_task': continue
             
             skill = msg.get('skill')
-            engine = msg.get('engine')
+            entrypoint = msg.get('entrypoint')
             task_id = msg.get('task_id')
             chat_id = msg.get('chat_id')
             metadata = msg.get('metadata', {})
@@ -178,7 +195,7 @@ def sqs_handler(event, context):
             logger.info(f"Checking task status (Attempt {retry_count})", extra=extra)
             
             # Execute check
-            check_output, err_str = run_engine(engine, ["check", "--id", task_id], extra)
+            check_output, err_str = run_engine(entrypoint, ["check", "--id", task_id], extra)
             
             if check_output is None:
                 logger.error(f"Status check failed: {err_str}", extra=extra)
