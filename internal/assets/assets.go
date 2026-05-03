@@ -12,7 +12,7 @@ import (
 //go:embed all:skeleton
 var privateWorkspace embed.FS
 
-//go:embed all:skeleton_default
+//go:embed all:skeleton_example
 var publicWorkspace embed.FS
 
 // RestoreWorkspace extracts the embedded workspace, prioritizing "skeleton" if present.
@@ -31,7 +31,7 @@ func RestoreWorkspace(destDir string) error {
 
 	if isPrivateEmpty {
 		sourceFS = publicWorkspace
-		sourcePrefix = "skeleton_default"
+		sourcePrefix = "skeleton_example"
 	}
 
 	return fs.WalkDir(sourceFS, sourcePrefix, func(path string, d fs.DirEntry, err error) error {
@@ -75,7 +75,7 @@ func RestoreSkills(destDir string) error {
 
 	if isPrivateEmpty {
 		sourceFS = publicWorkspace
-		sourcePrefix = "skeleton_default"
+		sourcePrefix = "skeleton_example"
 	}
 
 	skillsPrefix := filepath.Join(sourcePrefix, "skills")
@@ -106,5 +106,5 @@ func RestoreWorkspaceToReader(path string) (io.Reader, error) {
 	if r, err := privateWorkspace.Open(filepath.Join("skeleton", path)); err == nil {
 		return r, nil
 	}
-	return publicWorkspace.Open(filepath.Join("skeleton_default", path))
+	return publicWorkspace.Open(filepath.Join("skeleton_example", path))
 }

@@ -346,7 +346,7 @@ func (a *WorkerApp) handleMediaTranscription(ctx context.Context, inMsg *bus.Inb
 
 func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *bus.InboundMessage, isHeartbeat bool, taskMetadata map[string]any) error {
 	chatWorkspace := a.getWorkspacePath(chatID)
-	
+
 	triggerType := "message"
 	if isHeartbeat {
 		triggerType = "heartbeat"
@@ -359,7 +359,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 		Str("workspace", chatWorkspace).
 		Logger()
 	ctx = logger.WithContext(ctx)
- 
+
 	bucket := os.Getenv("PICOCLAW_WORKSPACE_BUCKET")
 	var s3Storage *aws.S3Storage
 	if bucket != "" {
@@ -369,21 +369,21 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 			logger.Error().Err(err).Msg("Failed to initialize S3 storage")
 		}
 	}
- 
+
 	startLog := logger.Info().
 		Str("trigger", triggerType).
 		Str("sender", inMsg.SenderID).
 		Str("content", inMsg.Content).
 		Int("media_count", len(inMsg.Media))
-	
+
 	if triggerType == "task_result" {
 		if taskID, ok := taskMetadata["_task_id"].(string); ok {
 			startLog = startLog.Str("task_id", taskID)
 		}
 	}
-	
+
 	startLog.Msg("Starting agent turn processing")
- 
+
 	// 1. Prepare Workspace (Download from S3)
 	isNew, err := a.prepareWorkspace(ctx, s3Storage, chatID, chatWorkspace)
 	if err != nil {
@@ -826,6 +826,17 @@ func (a *WorkerApp) buildEnv() []string {
 	filtered = append(filtered, "PYTHONPATH="+os.Getenv("PYTHONPATH"))
 	filtered = append(filtered, "PIP_TARGET="+os.Getenv("PIP_TARGET"))
 	filtered = append(filtered, "PIP_NO_CACHE_DIR="+os.Getenv("PIP_NO_CACHE_DIR"))
+
+	// Export enabled MCP server URLs to scripts
+	if cfg := a.Agent.GetConfig(); cfg != nil {
+		for name, server := range cfg.Tools.MCP.Servers {
+			if server.Enabled && server.URL != "" {
+				envName := fmt.Sprintf("MCP_%s_URL", strings.ToUpper(strings.ReplaceAll(name, "-", "_")))
+				filtered = append(filtered, envName+"="+server.URL)
+			}
+		}
+	}
+
 	return filtered
 }
 

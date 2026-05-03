@@ -21,3 +21,4 @@ html2text
 loguru
 pydantic
 piexif
+toon-format
