@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -51,13 +52,14 @@ type HeartbeatMessage struct {
 }
 
 type TaskResultMessage struct {
-	Type     string         `json:"type"`
-	TaskID   string         `json:"task_id"`
-	ChatID   string         `json:"chat_id"`
-	Skill    string         `json:"skill"`
-	Result   string         `json:"result"`
-	IsError  bool           `json:"is_error"`
-	Metadata map[string]any `json:"metadata"`
+	Type     string            `json:"type"`
+	TaskID   string            `json:"task_id"`
+	ChatID   string            `json:"chat_id"`
+	Skill    string            `json:"skill"`
+	Result   string            `json:"result"`
+	IsError  bool              `json:"is_error"`
+	Metadata map[string]any    `json:"metadata"`
+	Files    map[string]string `json:"files"`
 }
 
 func NewWorkerApp(ctx context.Context) (*WorkerApp, error) {
@@ -252,6 +254,11 @@ func (a *WorkerApp) tryHandleTaskResult(ctx context.Context, record events.SQSMe
 		status = "error"
 	}
 
+	content := fmt.Sprintf("[Background Task Result]\nSkill: %s\nTask ID: %s\nChat ID: %s\nStatus: %s\nOutput: %s", tr.Skill, tr.TaskID, tr.ChatID, status, tr.Result)
+	if len(tr.Files) > 0 {
+		content += "\n\n[System: Generated files have been automatically downloaded to your inbox/ directory. You can access them directly.]"
+	}
+
 	inMsg := &bus.InboundMessage{
 		Context: bus.InboundContext{
 			Channel: "telegram",
@@ -259,12 +266,15 @@ func (a *WorkerApp) tryHandleTaskResult(ctx context.Context, record events.SQSMe
 		},
 		ChatID:  tr.ChatID,
 		Channel: "telegram",
-		Content: fmt.Sprintf("[Background Task Result]\nSkill: %s\nTask ID: %s\nChat ID: %s\nStatus: %s\nOutput: %s", tr.Skill, tr.TaskID, tr.ChatID, status, tr.Result),
+		Content: content,
 	}
 	if tr.Metadata == nil {
 		tr.Metadata = make(map[string]any)
 	}
 	tr.Metadata["_task_id"] = tr.TaskID
+	if len(tr.Files) > 0 {
+		tr.Metadata["_files"] = tr.Files
+	}
 	return true, a.processAgentTurn(ctx, tr.ChatID, inMsg, false, tr.Metadata)
 }
 
@@ -420,6 +430,7 @@ func (a *WorkerApp) processAgentTurn(ctx context.Context, chatID string, inMsg *
 	}
 
 	// 4. Ingest Media
+	a.downloadTaskMedia(ctx, chatWorkspace, taskMetadata)
 	a.materializeMedia(ctx, chatWorkspace, inMsg)
 
 	// 5. Execute Turn
@@ -887,4 +898,66 @@ func (a *WorkerApp) initUserMetadata(workspace string, inMsg *bus.InboundMessage
 		sb.WriteString(fmt.Sprintf("- Language: %s\n", lang))
 	}
 	_ = os.WriteFile(userFile, []byte(sb.String()), 0o644)
+}
+
+func (a *WorkerApp) downloadTaskMedia(ctx context.Context, chatWorkspace string, taskMetadata map[string]any) {
+	filesRaw, ok := taskMetadata["_files"]
+	if !ok {
+		return
+	}
+
+	var files map[string]string
+	switch v := filesRaw.(type) {
+	case map[string]string:
+		files = v
+	case map[string]any:
+		files = make(map[string]string)
+		for k, val := range v {
+			if s, ok := val.(string); ok {
+				files[k] = s
+			}
+		}
+	}
+
+	if len(files) == 0 {
+		return
+	}
+
+	inboxDir := filepath.Join(chatWorkspace, "inbox")
+	_ = os.MkdirAll(inboxDir, 0755)
+
+	for name, url := range files {
+		destPath := filepath.Join(inboxDir, name)
+		err := a.downloadFile(ctx, url, destPath)
+		if err != nil {
+			log.Ctx(ctx).Error().Err(err).Str("url", url).Msg("Failed to pre-download task media")
+		} else {
+			log.Ctx(ctx).Info().Str("path", destPath).Msg("Pre-downloaded task media")
+		}
+	}
+}
+
+func (a *WorkerApp) downloadFile(ctx context.Context, url, destPath string) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bad status: %s", resp.Status)
+	}
+
+	out, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	return err
 }

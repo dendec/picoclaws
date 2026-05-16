@@ -196,7 +196,7 @@ def sqs_handler(event, context):
             
             # Execute check
             check_output, err_str = run_engine(entrypoint, ["check", "--id", task_id], extra)
-            
+            logger.info(f"Task {task_id} status: {check_output}", extra=extra)
             if check_output is None:
                 logger.error(f"Status check failed: {err_str}", extra=extra)
                 raise Exception(err_str)
@@ -210,7 +210,7 @@ def sqs_handler(event, context):
                 faulted = check_res.get('faulted') or check_res.get('error')
                 
                 if done or faulted:
-                    logger.info(f"Task completed (success={done}, error={bool(faulted)}). Sending result to worker.", extra=extra)
+                    logger.info(f"Task completed (success={done}, error={bool(faulted)}).", extra=extra)
                     if RESULT_QUEUE_URL:
                         result_msg = {
                             "type": "task_result",
@@ -221,6 +221,14 @@ def sqs_handler(event, context):
                             "result": check_output,
                             "is_error": bool(faulted)
                         }
+                        
+                        # Extract files for pre-downloading if provided by the skill engine
+                        files = check_res.get("files")
+                        if files:
+                            result_msg["files"] = files
+                            logger.info(f"Found {len(files)} files to pre-download. Including in result message.", extra=extra)
+
+                        logger.info(f"Sending result to worker via {RESULT_QUEUE_URL}", extra=extra)
                         sqs.send_message(QueueUrl=RESULT_QUEUE_URL, MessageBody=json.dumps(result_msg), MessageGroupId=str(chat_id))
                     return
             except Exception as e:
