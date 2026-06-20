@@ -61,8 +61,8 @@ github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfv
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dendec/picoclaw v0.0.0-20260620093041-e486d859b700 h1:5poj25KsAb2S1gWERWYrZtDk9JIxysNriWdVqatAJo0=
-github.com/dendec/picoclaw v0.0.0-20260620093041-e486d859b700/go.mod h1:6hG5vSQ375XVAyH1DwseGdbJGXwMQkpwhnkmjPX9DIM=
+github.com/dendec/picoclaw v0.0.0-20260620094157-640f0febd1c2 h1:VMzF9ZlThCCgQxe++0jbTWFZngoOE4kEolWR6BF2z6E=
+github.com/dendec/picoclaw v0.0.0-20260620094157-640f0febd1c2/go.mod h1:6hG5vSQ375XVAyH1DwseGdbJGXwMQkpwhnkmjPX9DIM=
 github.com/dnaeon/go-vcr v1.2.0 h1:zHCHvJYTMh1N7xnV7zf1m1GPBF9Ad0Jk/whtQ1663qI=
 github.com/dnaeon/go-vcr v1.2.0/go.mod h1:R4UdLID7HZT3taECzJs4YgbbH6PIGXB6W/sc5OLb6RQ=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=

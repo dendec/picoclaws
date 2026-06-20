@@ -92,4 +92,4 @@ require (
 	modernc.org/sqlite v1.50.1 // indirect
 )
 
-replace github.com/sipeed/picoclaw => github.com/dendec/picoclaw v0.0.0-20260620093041-e486d859b700
+replace github.com/sipeed/picoclaw => github.com/dendec/picoclaw v0.0.0-20260620094157-640f0febd1c2
