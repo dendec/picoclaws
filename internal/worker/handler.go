@@ -478,6 +478,83 @@ func (a *WorkerApp) configureEnvironment(chatWorkspace string) {
 	os.Setenv("PYTHONPATH", newPyPath)
 }
 
+func writeReaderToFile(r io.Reader, dstPath string) error {
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return err
+	}
+
+	dst, err := os.Create(dstPath)
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, r)
+	return err
+}
+
+func copyFile(srcPath, dstPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	return writeReaderToFile(src, dstPath)
+}
+
+func tryHotSwapConfigFile(ctx context.Context, chatWorkspace, filename, srcPath string) (string, bool) {
+	destNameLower := strings.ToLower(filename)
+	var targetPath string
+	var backupPath string
+	var configName string
+
+	switch destNameLower {
+	case "soul.md", "soul.txt":
+		targetPath = filepath.Join(chatWorkspace, "SOUL.md")
+		backupPath = filepath.Join(chatWorkspace, "SOUL.bak")
+		configName = "SOUL.md"
+	case "user.md", "user.txt":
+		targetPath = filepath.Join(chatWorkspace, "USER.md")
+		backupPath = filepath.Join(chatWorkspace, "USER.bak")
+		configName = "USER.md"
+	case "memory.md", "memory.txt":
+		targetPath = filepath.Join(chatWorkspace, "memory", "MEMORY.md")
+		backupPath = filepath.Join(chatWorkspace, "memory", "MEMORY.bak")
+		configName = "memory/MEMORY.md"
+	default:
+		return "", false
+	}
+
+	fi, err := os.Stat(srcPath)
+	if err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("path", srcPath).Msg("Failed to stat uploaded file")
+		return "", false
+	}
+	if fi.Size() > 2048 {
+		log.Ctx(ctx).Warn().Str("filename", filename).Int64("size", fi.Size()).Msg("Uploaded configuration file exceeds 2KB limit, skipping replacement")
+		return "", false
+	}
+
+	// Backup if original exists
+	if _, err := os.Stat(targetPath); err == nil {
+		if err := copyFile(targetPath, backupPath); err != nil {
+			log.Ctx(ctx).Error().Err(err).Str("src", targetPath).Str("dst", backupPath).Msg("Failed to backup file")
+		} else {
+			log.Ctx(ctx).Info().Str("src", targetPath).Str("dst", backupPath).Msg("Backup created successfully")
+		}
+	}
+
+	// Copy to target path
+	if err := copyFile(srcPath, targetPath); err != nil {
+		log.Ctx(ctx).Error().Err(err).Str("src", srcPath).Str("dst", targetPath).Msg("Failed to replace configuration file")
+		return "", false
+	}
+
+	log.Ctx(ctx).Info().Str("src", srcPath).Str("dst", targetPath).Msg("Configuration file replaced successfully")
+	return configName, true
+}
+
 func (a *WorkerApp) materializeMedia(ctx context.Context, chatWorkspace string, inMsg *bus.InboundMessage) {
 	if len(inMsg.Media) == 0 {
 		return
@@ -486,6 +563,7 @@ func (a *WorkerApp) materializeMedia(ctx context.Context, chatWorkspace string, 
 	inboxDir := filepath.Join(chatWorkspace, "inbox")
 	_ = os.MkdirAll(inboxDir, 0755)
 	var attachedFiles []string
+	var replacedFiles []string
 
 	for _, ref := range inMsg.Media {
 		path, meta, err := a.MediaStore.ResolveWithMeta(ref)
@@ -498,38 +576,34 @@ func (a *WorkerApp) materializeMedia(ctx context.Context, chatWorkspace string, 
 		if destName == "" {
 			destName = filepath.Base(path)
 		}
+
+		if configName, ok := tryHotSwapConfigFile(ctx, chatWorkspace, destName, path); ok {
+			replacedFiles = append(replacedFiles, configName)
+			continue
+		}
+
 		destPath := filepath.Join(inboxDir, destName)
-
-		err = func() error {
-			src, err := os.Open(path)
-			if err != nil {
-				return err
-			}
-			defer src.Close()
-
-			dst, err := os.Create(destPath)
-			if err != nil {
-				return err
-			}
-			defer dst.Close()
-
-			_, err = io.Copy(dst, src)
-			return err
-		}()
-
-		if err != nil {
+		if err := copyFile(path, destPath); err != nil {
 			log.Ctx(ctx).Error().Err(err).Str("src", path).Str("dst", destPath).Msg("Failed to copy media to inbox")
 		} else {
 			attachedFiles = append(attachedFiles, destName)
 		}
 	}
 
+	var hints []string
+	if len(replacedFiles) > 0 {
+		hints = append(hints, "[System: Configuration files updated: "+strings.Join(replacedFiles, ", ")+"]")
+	}
 	if len(attachedFiles) > 0 {
-		hint := "[System: User attached files in inbox/: " + strings.Join(attachedFiles, ", ") + "]"
+		hints = append(hints, "[System: User attached files in inbox/: "+strings.Join(attachedFiles, ", ")+"]")
+	}
+
+	if len(hints) > 0 {
+		hintStr := strings.Join(hints, "\n\n")
 		if inMsg.Content != "" {
-			inMsg.Content += "\n\n" + hint
+			inMsg.Content += "\n\n" + hintStr
 		} else {
-			inMsg.Content = hint
+			inMsg.Content = hintStr
 		}
 	}
 }
@@ -952,12 +1026,5 @@ func (a *WorkerApp) downloadFile(ctx context.Context, url, destPath string) erro
 		return fmt.Errorf("bad status: %s", resp.Status)
 	}
 
-	out, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	_, err = io.Copy(out, resp.Body)
-	return err
+	return writeReaderToFile(resp.Body, destPath)
 }
